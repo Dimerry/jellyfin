@@ -657,6 +657,16 @@ public class VideoToolsController : BaseJellyfinApiController
             "-b:v", bitrateKbps.ToString(CultureInfo.InvariantCulture) + "k"
         });
 
+        // The encoder derives its frame-rate based bitrate control from the stream frame rate, which is
+        // wrong on lots of remuxed/phone files (120/1 reported for a 30 fps video). A 3000k request then
+        // yields a quarter of the bitrate. Pinning the output rate to the real average rate fixes it.
+        var frameRate = GetEncoderFrameRate(probe);
+        if (frameRate > 0)
+        {
+            args.Add("-r");
+            args.Add(FormatFrameRate(frameRate));
+        }
+
         if (!isAv1)
         {
             args.AddRange(new[]
@@ -694,6 +704,47 @@ public class VideoToolsController : BaseJellyfinApiController
         return args;
     }
 
+    /// <summary>
+    /// Picks the frame rate the encoder should assume: the real average rate when it is usable,
+    /// otherwise the container's nominal rate.
+    /// </summary>
+    /// <param name="probe">The probed source.</param>
+    /// <returns>The frame rate, or 0 when it is unknown.</returns>
+    private static double GetEncoderFrameRate(MediaProbe probe)
+    {
+        if (probe.FrameRate >= 1)
+        {
+            return probe.FrameRate;
+        }
+
+        return probe.NominalFrameRate >= 1 ? probe.NominalFrameRate : 0;
+    }
+
+    /// <summary>
+    /// Snaps a measured frame rate to the common broadcast/web rates so the muxer writes a clean
+    /// rate (30 instead of 29.9996).
+    /// </summary>
+    /// <param name="frameRate">The measured rate.</param>
+    /// <returns>The rate as an ffmpeg argument value.</returns>
+    private static string FormatFrameRate(double frameRate)
+    {
+        double[] standardRates = { 23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 100, 119.88, 120 };
+        var best = frameRate;
+        var bestDelta = 0.05;
+        foreach (var standard in standardRates)
+        {
+            var delta = Math.Abs(frameRate - standard);
+            if (delta < bestDelta)
+            {
+                bestDelta = delta;
+                best = standard;
+            }
+        }
+
+        return Math.Round(best, 3, MidpointRounding.AwayFromZero)
+            .ToString("0.###", CultureInfo.InvariantCulture);
+    }
+
     private static (int Width, int Height)? GetTargetSize(MediaProbe probe, int maxHeight)
     {
         if (probe.Width <= 0 || probe.Height <= 0 || probe.Height <= maxHeight)
@@ -706,6 +757,34 @@ public class VideoToolsController : BaseJellyfinApiController
             MidpointRounding.AwayFromZero);
         width = Math.Max(2, width & ~1);
         return (width, maxHeight);
+    }
+
+    /// <summary>
+    /// Reads an ffprobe frame rate value such as "30000/1001".
+    /// </summary>
+    /// <param name="stream">The stream element.</param>
+    /// <param name="propertyName">The property name.</param>
+    /// <returns>The rate in frames per second, or 0 when it is missing.</returns>
+    private static double ParseFrameRate(JsonElement stream, string propertyName)
+    {
+        var value = GetString(stream, propertyName);
+        if (string.IsNullOrEmpty(value))
+        {
+            return 0;
+        }
+
+        var separator = value.IndexOf('/', StringComparison.Ordinal);
+        if (separator > 0
+            && double.TryParse(value[..separator], NumberStyles.Float, CultureInfo.InvariantCulture, out var numerator)
+            && double.TryParse(value[(separator + 1)..], NumberStyles.Float, CultureInfo.InvariantCulture, out var denominator)
+            && denominator > 0)
+        {
+            return numerator / denominator;
+        }
+
+        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : 0;
     }
 
     private static MediaProbe ProbeSource(string sourcePath, string probePath)
@@ -752,6 +831,8 @@ public class VideoToolsController : BaseJellyfinApiController
 
             var width = 0;
             var height = 0;
+            var frameRate = 0d;
+            var nominalFrameRate = 0d;
             var subtitleIndexes = new List<int>();
             if (root.TryGetProperty("streams", out var streams))
             {
@@ -779,6 +860,9 @@ public class VideoToolsController : BaseJellyfinApiController
                         {
                             height = parsedHeight;
                         }
+
+                        frameRate = ParseFrameRate(stream, "avg_frame_rate");
+                        nominalFrameRate = ParseFrameRate(stream, "r_frame_rate");
                     }
                     else if (codecType == "subtitle")
                     {
@@ -793,7 +877,7 @@ public class VideoToolsController : BaseJellyfinApiController
                 }
             }
 
-            return new MediaProbe(duration, width, height, subtitleIndexes);
+            return new MediaProbe(duration, width, height, subtitleIndexes, frameRate, nominalFrameRate);
         }
         catch (Exception)
         {
@@ -809,7 +893,7 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <summary>
     /// Builds the final and temporary paths for a transcode. The finished file takes over the source name
     /// with an mp4 container (no codec/container marker in the name), so the source itself is parked as
-    /// "&lt;name&gt;.&lt;ext&gt;.old" when the job succeeds.
+    /// "&lt;name&gt;.old&lt;ext&gt;" when the job succeeds.
     /// </summary>
     /// <param name="sourcePath">The source file path.</param>
     /// <returns>The final path and the temporary work path.</returns>
@@ -826,6 +910,38 @@ public class VideoToolsController : BaseJellyfinApiController
 
         var workPath = GetUniquePath(Path.Combine(directory, "." + baseName + ".videotools.mp4"));
         return (finalPath, workPath);
+    }
+
+    /// <summary>
+    /// Builds the path that keeps the original file after a transcode, e.g. "clip.mp4" becomes
+    /// "clip.old.mp4". A numbered marker is inserted when a backup already exists.
+    /// </summary>
+    /// <param name="sourcePath">The original file path.</param>
+    /// <returns>The free backup path.</returns>
+    private static string GetOldPath(string sourcePath)
+    {
+        var directory = Path.GetDirectoryName(sourcePath)!;
+        var name = Path.GetFileNameWithoutExtension(sourcePath);
+        var extension = Path.GetExtension(sourcePath);
+
+        var candidate = Path.Combine(directory, name + ".old" + extension);
+        if (!PathExists(candidate))
+        {
+            return candidate;
+        }
+
+        for (var i = 1; i < 1000; i++)
+        {
+            candidate = Path.Combine(
+                directory,
+                name + " (" + i.ToString(CultureInfo.InvariantCulture) + ").old" + extension);
+            if (!PathExists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new IOException("Could not find a free backup file name.");
     }
 
     private static string GetFreePath(string path)
@@ -988,7 +1104,7 @@ public class VideoToolsController : BaseJellyfinApiController
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(10), cts.Token).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromSeconds(2), cts.Token).ConfigureAwait(false);
 
                     List<string> folders;
                     lock (_scanLock)
@@ -1215,7 +1331,8 @@ public class VideoToolsController : BaseJellyfinApiController
 
     /// <summary>
     /// Moves the finished temporary file into place. For transcodes the original file is kept next to
-    /// the new one with an extra ".old" suffix, so the new file can take over the original name.
+    /// the new one with an ".old" marker before its extension, so the new file can take over the
+    /// original name.
     /// </summary>
     /// <param name="job">The finished job.</param>
     private static void FinalizeOutput(VideoToolJobDto job)
@@ -1224,7 +1341,7 @@ public class VideoToolsController : BaseJellyfinApiController
             && System.IO.File.Exists(job.SourcePath)
             && !string.Equals(job.SourcePath, job.WorkPath, StringComparison.Ordinal))
         {
-            var oldPath = GetFreePath(job.SourcePath + ".old");
+            var oldPath = GetOldPath(job.SourcePath);
             System.IO.File.Move(job.SourcePath, oldPath, overwrite: false);
         }
 
@@ -1242,7 +1359,9 @@ public class VideoToolsController : BaseJellyfinApiController
         double Duration,
         int Width,
         int Height,
-        IReadOnlyList<int> SubtitleIndexes);
+        IReadOnlyList<int> SubtitleIndexes,
+        double FrameRate,
+        double NominalFrameRate);
 
     private sealed record JobWork(
         VideoToolJobDto Job,
