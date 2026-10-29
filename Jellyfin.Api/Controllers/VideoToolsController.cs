@@ -142,7 +142,7 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="itemId">The item id.</param>
     /// <param name="startSeconds">Seconds to remove from the start.</param>
     /// <param name="endSeconds">Seconds to remove from the end.</param>
-    /// <param name="rotation">Clockwise rotation in degrees (0, 90, 180 or 270).</param>
+    /// <param name="rotation">Counter-clockwise rotation in degrees (0, 90, 180 or 270).</param>
     /// <returns>The created job.</returns>
     [HttpPost("{itemId}/Cut")]
     public ActionResult<VideoToolJobDto> StartCut(
@@ -610,13 +610,12 @@ public class VideoToolsController : BaseJellyfinApiController
 
         // -display_rotation is an input option: it rewrites the display matrix, so the
         // stream can still be copied bit-for-bit instead of being re-encoded.
-        // ffmpeg's sign convention is inverted compared to "clockwise on screen":
-        // passing 90 makes players turn the picture 90 degrees counter-clockwise,
-        // so the value has to be mirrored to give the user what they picked.
+        // The value is a counter-clockwise angle, which is what the UI offers, so it is
+        // passed through unchanged (ffmpeg's convention matches the label for CCW).
         if (rotation != 0)
         {
             args.Add("-display_rotation");
-            args.Add(((360 - rotation) % 360).ToString(CultureInfo.InvariantCulture));
+            args.Add(rotation.ToString(CultureInfo.InvariantCulture));
         }
 
         args.AddRange(
