@@ -1,0 +1,1253 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Jellyfin.Api.Models.VideoToolDtos;
+using MediaBrowser.Common.Api;
+using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.MediaEncoding;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+
+namespace Jellyfin.Api.Controllers;
+
+/// <summary>
+/// Custom video tools: transcode an item to AV1/H.265 or cut a clip, writing the result next to the source file.
+/// </summary>
+[Authorize(Policy = Policies.RequiresElevation)]
+[Tags("VideoTools")]
+public class VideoToolsController : BaseJellyfinApiController
+{
+    private static readonly ConcurrentDictionary<Guid, VideoToolJobDto> _jobs = new();
+    private static readonly ConcurrentDictionary<Guid, Process> _processes = new();
+    private static readonly ConcurrentQueue<JobWork> _pending = new();
+    private static readonly SemaphoreSlim _pendingSignal = new(0);
+    private static readonly object _workerLock = new();
+    private static readonly object _pathLock = new();
+    private static readonly object _renameLock = new();
+    private static readonly object _scanLock = new();
+    private static readonly HashSet<string> _reservedPaths = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> _foldersToScan = new(StringComparer.OrdinalIgnoreCase);
+    private static CancellationTokenSource? _scanCts;
+    private static bool _workerStarted;
+
+    private readonly ILibraryManager _libraryManager;
+    private readonly ILibraryMonitor _libraryMonitor;
+    private readonly IMediaEncoder _mediaEncoder;
+    private readonly ILogger<VideoToolsController> _logger;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="VideoToolsController"/> class.
+    /// </summary>
+    /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
+    /// <param name="libraryMonitor">Instance of the <see cref="ILibraryMonitor"/> interface.</param>
+    /// <param name="mediaEncoder">Instance of the <see cref="IMediaEncoder"/> interface.</param>
+    /// <param name="logger">Instance of the <see cref="ILogger"/> interface.</param>
+    public VideoToolsController(
+        ILibraryManager libraryManager,
+        ILibraryMonitor libraryMonitor,
+        IMediaEncoder mediaEncoder,
+        ILogger<VideoToolsController> logger)
+    {
+        _libraryManager = libraryManager;
+        _libraryMonitor = libraryMonitor;
+        _mediaEncoder = mediaEncoder;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Starts a background transcode of a video item to AV1 (software) or H.265 (Intel QSV hardware).
+    /// The source file is renamed to "&lt;name&gt;.&lt;ext&gt;.old" when the job succeeds and the new file
+    /// takes over the original name with an mp4 container.
+    /// </summary>
+    /// <param name="itemId">The item id.</param>
+    /// <param name="codec">Target codec: h265 (default, QSV) or av1 (software, slower).</param>
+    /// <param name="bitrateKbps">Target video bitrate in kbps.</param>
+    /// <param name="resolution">Maximum output resolution: 1080p (default) or 4k. Sources smaller than the limit are not upscaled.</param>
+    /// <returns>The created job.</returns>
+    [HttpPost("{itemId}/Transcode")]
+    public ActionResult<VideoToolJobDto> StartTranscode(
+        [FromRoute] Guid itemId,
+        [FromQuery] string codec = "h265",
+        [FromQuery] int bitrateKbps = 3000,
+        [FromQuery] string resolution = "1080p")
+    {
+        var item = _libraryManager.GetItemById(itemId);
+        if (item is null)
+        {
+            return NotFound();
+        }
+
+        var sourcePath = item.Path;
+        if (string.IsNullOrWhiteSpace(sourcePath) || !System.IO.File.Exists(sourcePath))
+        {
+            return BadRequest("Item has no local video file.");
+        }
+
+        codec = codec.Trim().ToLowerInvariant();
+        if (codec is not ("av1" or "h265" or "hevc"))
+        {
+            return BadRequest("codec must be 'av1' or 'h265'.");
+        }
+
+        if (bitrateKbps < 100 || bitrateKbps > 200000)
+        {
+            return BadRequest("bitrateKbps must be between 100 and 200000.");
+        }
+
+        var maxHeight = resolution.Trim().ToLowerInvariant() switch
+        {
+            "1080p" => 1080,
+            "4k" or "2160p" => 2160,
+            _ => 0
+        };
+        if (maxHeight == 0)
+        {
+            return BadRequest("resolution must be '1080p' or '4k'.");
+        }
+
+        var probe = ProbeSource(
+            sourcePath,
+            string.IsNullOrWhiteSpace(_mediaEncoder.ProbePath) ? "ffprobe" : _mediaEncoder.ProbePath);
+        var duration = probe.Duration > 0
+            ? probe.Duration
+            : TimeSpan.FromTicks(item.RunTimeTicks ?? 0).TotalSeconds;
+
+        var paths = CreateTranscodePaths(sourcePath);
+        var outputPath = paths.FinalPath;
+
+        var args = BuildTranscodeArgs(sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, probe);
+
+        var job = CreateJob("Transcode", item.Name, outputPath, sourcePath, duration);
+        job.WorkPath = paths.WorkPath;
+        job.Codec = codec == "av1" ? "AV1" : "H.265";
+        job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
+        job.BitrateKbps = bitrateKbps;
+        StartJob(job, args);
+        return Accepted(job);
+    }
+
+    /// <summary>
+    /// Starts a background job that cuts the given number of seconds from the start and the end of a video item,
+    /// keeping the middle part. The output is written next to the source file as "&lt;name&gt;.cut&lt;ext&gt;".
+    /// </summary>
+    /// <param name="itemId">The item id.</param>
+    /// <param name="startSeconds">Seconds to remove from the start.</param>
+    /// <param name="endSeconds">Seconds to remove from the end.</param>
+    /// <returns>The created job.</returns>
+    [HttpPost("{itemId}/Cut")]
+    public ActionResult<VideoToolJobDto> StartCut(
+        [FromRoute] Guid itemId,
+        [FromQuery] double startSeconds = 0,
+        [FromQuery] double endSeconds = 0)
+    {
+        var item = _libraryManager.GetItemById(itemId);
+        if (item is null)
+        {
+            return NotFound();
+        }
+
+        var sourcePath = item.Path;
+        if (string.IsNullOrWhiteSpace(sourcePath) || !System.IO.File.Exists(sourcePath))
+        {
+            return BadRequest("Item has no local video file.");
+        }
+
+        var duration = TimeSpan.FromTicks(item.RunTimeTicks ?? 0).TotalSeconds;
+        if (duration <= 0)
+        {
+            return BadRequest("Item duration is unknown.");
+        }
+
+        if (!double.IsFinite(startSeconds) || !double.IsFinite(endSeconds)
+            || startSeconds < 0 || endSeconds < 0)
+        {
+            return BadRequest("Trim values must be zero or positive numbers.");
+        }
+
+        if (startSeconds + endSeconds >= duration)
+        {
+            return BadRequest("Trim values remove the whole video.");
+        }
+
+        var keepSeconds = duration - startSeconds - endSeconds;
+        var outputPath = GetUniquePath(Path.Combine(
+            Path.GetDirectoryName(sourcePath)!,
+            Path.GetFileNameWithoutExtension(sourcePath) + ".cut" + Path.GetExtension(sourcePath)));
+
+        var args = BuildCutArgs(sourcePath, outputPath, startSeconds, keepSeconds);
+
+        var job = CreateJob("Cut", item.Name, outputPath, sourcePath, duration);
+        job.WorkPath = outputPath;
+        job.CutStartSeconds = startSeconds;
+        job.CutEndSeconds = endSeconds;
+        StartJob(job, args);
+        return Accepted(job);
+    }
+
+    /// <summary>
+    /// Gets recent jobs.
+    /// </summary>
+    /// <returns>The list of jobs.</returns>
+    [HttpGet("Jobs")]
+    public ActionResult<List<VideoToolJobDto>> GetJobs()
+        => Ok(_jobs.Values.OrderByDescending(j => j.CreatedAt).Take(50).ToList());
+
+    /// <summary>
+    /// Gets a single job by id.
+    /// </summary>
+    /// <param name="jobId">The job id.</param>
+    /// <returns>The job.</returns>
+    [HttpGet("Jobs/{jobId}")]
+    public ActionResult<VideoToolJobDto> GetJob([FromRoute] Guid jobId)
+    {
+        if (!_jobs.TryGetValue(jobId, out var job))
+        {
+            return NotFound();
+        }
+
+        return Ok(job);
+    }
+
+    /// <summary>
+    /// Clears completed and failed jobs from the in-memory history. Active jobs are kept.
+    /// </summary>
+    /// <returns>The number of removed jobs.</returns>
+    [HttpDelete("Jobs/Finished")]
+    public ActionResult<int> ClearFinishedJobs()
+    {
+        var finishedIds = _jobs
+            .Where(pair => pair.Value.Status is "Completed" or "Failed" or "Canceled")
+            .Select(pair => pair.Key)
+            .ToList();
+
+        foreach (var id in finishedIds)
+        {
+            _jobs.TryRemove(id, out _);
+        }
+
+        return Ok(finishedIds.Count);
+    }
+
+    /// <summary>
+    /// Re-runs a failed job with its original settings and a new output file name.
+    /// </summary>
+    /// <param name="jobId">The failed job id.</param>
+    /// <returns>The newly queued job.</returns>
+    [HttpPost("Jobs/{jobId}/Retry")]
+    public ActionResult<VideoToolJobDto> RetryJob([FromRoute] Guid jobId)
+    {
+        if (!_jobs.TryGetValue(jobId, out var failedJob))
+        {
+            return NotFound();
+        }
+
+        if (!string.Equals(failedJob.Status, "Failed", StringComparison.OrdinalIgnoreCase))
+        {
+            return BadRequest("Only failed jobs can be retried.");
+        }
+
+        if (string.IsNullOrWhiteSpace(failedJob.SourcePath) || !System.IO.File.Exists(failedJob.SourcePath))
+        {
+            return BadRequest("The source file no longer exists.");
+        }
+
+        try
+        {
+            var probe = ProbeSource(
+                failedJob.SourcePath,
+                string.IsNullOrWhiteSpace(_mediaEncoder.ProbePath) ? "ffprobe" : _mediaEncoder.ProbePath);
+            var duration = probe.Duration > 0 ? probe.Duration : failedJob.SourceDurationSeconds;
+
+            if (string.Equals(failedJob.Kind, "Transcode", StringComparison.OrdinalIgnoreCase))
+            {
+                var codec = string.Equals(failedJob.Codec, "AV1", StringComparison.OrdinalIgnoreCase) ? "av1" : "h265";
+                var maxHeight = string.Equals(failedJob.Resolution, "4K", StringComparison.OrdinalIgnoreCase) ? 2160 : 1080;
+                var bitrateKbps = failedJob.BitrateKbps ?? 3000;
+
+                var paths = CreateTranscodePaths(failedJob.SourcePath);
+                var outputPath = paths.FinalPath;
+                var args = BuildTranscodeArgs(failedJob.SourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, probe);
+
+                var job = CreateJob("Transcode", failedJob.ItemName, outputPath, failedJob.SourcePath, duration);
+                job.WorkPath = paths.WorkPath;
+                job.Codec = codec == "av1" ? "AV1" : "H.265";
+                job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
+                job.BitrateKbps = bitrateKbps;
+                StartJob(job, args);
+                return Accepted(job);
+            }
+
+            if (string.Equals(failedJob.Kind, "Cut", StringComparison.OrdinalIgnoreCase))
+            {
+                var startSeconds = failedJob.CutStartSeconds;
+                var endSeconds = failedJob.CutEndSeconds;
+                if (duration <= 0 || startSeconds + endSeconds >= duration)
+                {
+                    return BadRequest("The original cut range is no longer valid for this video.");
+                }
+
+                var keepSeconds = duration - startSeconds - endSeconds;
+                var outputPath = GetUniquePath(Path.Combine(
+                    Path.GetDirectoryName(failedJob.SourcePath)!,
+                    Path.GetFileNameWithoutExtension(failedJob.SourcePath) + ".cut" + Path.GetExtension(failedJob.SourcePath)));
+
+                var job = CreateJob("Cut", failedJob.ItemName, outputPath, failedJob.SourcePath, duration);
+                job.WorkPath = outputPath;
+                job.CutStartSeconds = startSeconds;
+                job.CutEndSeconds = endSeconds;
+                StartJob(job, BuildCutArgs(failedJob.SourcePath, outputPath, startSeconds, keepSeconds));
+                return Accepted(job);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retry video tool job {JobId}", jobId);
+            return BadRequest(ex.Message);
+        }
+
+        return BadRequest("Unsupported job kind.");
+    }
+
+    /// <summary>
+    /// Cancels a queued or running job. Finished jobs cannot be canceled.
+    /// </summary>
+    /// <param name="jobId">The job id.</param>
+    /// <returns>The updated job.</returns>
+    [HttpPost("Jobs/{jobId}/Cancel")]
+    public ActionResult<VideoToolJobDto> CancelJob([FromRoute] Guid jobId)
+    {
+        if (!_jobs.TryGetValue(jobId, out var job))
+        {
+            return NotFound();
+        }
+
+        if (job.Status is "Completed" or "Failed" or "Canceled")
+        {
+            return BadRequest("Job is already finished.");
+        }
+
+        job.CancelRequested = true;
+
+        if (string.Equals(job.Status, "Queued", StringComparison.OrdinalIgnoreCase))
+        {
+            MarkCanceled(job);
+            UpdateQueuePositions();
+            return Ok(job);
+        }
+
+        if (_processes.TryGetValue(jobId, out var process))
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to kill process for video tool job {JobId}", jobId);
+            }
+        }
+
+        job.Status = "Canceled";
+        job.QueuePosition = null;
+        job.CompletedAt = DateTimeOffset.UtcNow;
+        UpdateQueuePositions();
+        return Accepted(job);
+    }
+
+    /// <summary>
+    /// Gets the current on-disk name of an item, so the client can prefill the rename dialog.
+    /// </summary>
+    /// <param name="itemId">The item id.</param>
+    /// <returns>The current file or folder name.</returns>
+    [HttpGet("{itemId}/RenameInfo")]
+    public ActionResult<ItemRenameInfoDto> GetRenameInfo([FromRoute] Guid itemId)
+    {
+        var item = _libraryManager.GetItemById(itemId);
+        if (item is null)
+        {
+            return NotFound();
+        }
+
+        var path = item.Path;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return BadRequest("Item has no local path.");
+        }
+
+        var isFolder = Directory.Exists(path);
+        if (!isFolder && !System.IO.File.Exists(path))
+        {
+            return BadRequest("The item file no longer exists.");
+        }
+
+        return Ok(new ItemRenameInfoDto
+        {
+            Name = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)),
+            IsFolder = isFolder,
+            Path = path
+        });
+    }
+
+    /// <summary>
+    /// Renames the file or folder behind an item on disk.
+    /// </summary>
+    /// <param name="itemId">The item id.</param>
+    /// <param name="newName">The new name, including the file extension for files.</param>
+    /// <param name="onConflict">What to do when the target already exists: ask, keepBoth or overwrite.</param>
+    /// <returns>The rename result; <c>Conflict</c> is true when the client has to ask the user.</returns>
+    [HttpPost("{itemId}/Rename")]
+    public ActionResult<ItemRenameResultDto> RenameItem(
+        [FromRoute] Guid itemId,
+        [FromQuery] string newName,
+        [FromQuery] string onConflict = "ask")
+    {
+        var item = _libraryManager.GetItemById(itemId);
+        if (item is null)
+        {
+            return NotFound();
+        }
+
+        var typeName = item.GetType().Name;
+        if (typeName is "CollectionFolder" or "UserView" or "AggregateFolder")
+        {
+            return BadRequest("Library folders cannot be renamed here.");
+        }
+
+        var path = item.Path;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return BadRequest("Item has no local path.");
+        }
+
+        var isFolder = Directory.Exists(path);
+        if (!isFolder && !System.IO.File.Exists(path))
+        {
+            return BadRequest("The item file no longer exists.");
+        }
+
+        newName = (newName ?? string.Empty).Trim();
+        if (!IsValidName(newName))
+        {
+            return BadRequest("Invalid name.");
+        }
+
+        onConflict = string.IsNullOrWhiteSpace(onConflict) ? "ask" : onConflict.Trim().ToLowerInvariant();
+        if (onConflict is not ("ask" or "keepboth" or "overwrite"))
+        {
+            return BadRequest("onConflict must be 'ask', 'keepBoth' or 'overwrite'.");
+        }
+
+        var directory = Path.GetDirectoryName(path)!;
+        var proposed = newName;
+        if (!isFolder && Path.GetExtension(proposed).Length == 0)
+        {
+            // Keep the original extension when the user only typed a new base name.
+            proposed += Path.GetExtension(path);
+        }
+
+        lock (_renameLock)
+        {
+            var target = Path.Combine(directory, proposed);
+            if (string.Equals(target, path, StringComparison.Ordinal))
+            {
+                return Ok(new ItemRenameResultDto { Success = true, NewName = proposed, NewPath = path });
+            }
+
+            var overwritten = false;
+            if (PathExists(target))
+            {
+                if (onConflict == "keepboth")
+                {
+                    target = GetFreePath(target);
+                }
+                else if (onConflict == "overwrite")
+                {
+                    DeletePath(target);
+                    overwritten = true;
+                }
+                else
+                {
+                    return Ok(new ItemRenameResultDto { Success = false, Conflict = true, NewName = proposed });
+                }
+            }
+
+            try
+            {
+                if (isFolder)
+                {
+                    Directory.Move(path, target);
+                }
+                else
+                {
+                    System.IO.File.Move(path, target);
+                }
+
+                _libraryMonitor.ReportFileSystemChanged(directory);
+                _logger.LogInformation("Renamed {OldPath} to {NewPath}", path, target);
+
+                return Ok(new ItemRenameResultDto
+                {
+                    Success = true,
+                    Overwritten = overwritten,
+                    NewName = Path.GetFileName(target.TrimEnd(Path.DirectorySeparatorChar)),
+                    NewPath = target
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to rename {Path}", path);
+                return BadRequest(ex.Message);
+            }
+        }
+    }
+
+    private static bool IsValidName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name is "." or ".." || name.Length > 255)
+        {
+            return false;
+        }
+
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+            || name.Contains('/', StringComparison.Ordinal)
+            || name.Contains('\\', StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return name is not ("CON" or "PRN" or "AUX" or "NUL");
+    }
+
+    private static void DeletePath(string path)
+    {
+        if (Directory.Exists(path))
+        {
+            Directory.Delete(path, recursive: true);
+        }
+        else if (System.IO.File.Exists(path))
+        {
+            System.IO.File.Delete(path);
+        }
+    }
+
+    /// <summary>
+    /// Streams the completed output file for a job.
+    /// </summary>
+    /// <param name="jobId">The job id.</param>
+    /// <returns>The output file.</returns>
+    [HttpGet("Jobs/{jobId}/Stream")]
+    public ActionResult StreamJob([FromRoute] Guid jobId)
+    {
+        if (!_jobs.TryGetValue(jobId, out var job)
+            || !string.Equals(job.Status, "Completed", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(job.OutputPath)
+            || !System.IO.File.Exists(job.OutputPath))
+        {
+            return NotFound();
+        }
+
+        var contentType = Path.GetExtension(job.OutputPath).ToLowerInvariant() switch
+        {
+            ".mp4" => "video/mp4",
+            ".mkv" => "video/x-matroska",
+            ".mov" => "video/quicktime",
+            _ => "application/octet-stream"
+        };
+
+        return new PhysicalFileResult(job.OutputPath, contentType)
+        {
+            EnableRangeProcessing = true
+        };
+    }
+
+    private static VideoToolJobDto CreateJob(string kind, string itemName, string outputPath, string sourcePath, double duration)
+    {
+        var job = new VideoToolJobDto
+        {
+            Id = Guid.NewGuid(),
+            Kind = kind,
+            ItemName = itemName,
+            OutputPath = outputPath,
+            Status = "Queued",
+            CreatedAt = DateTimeOffset.UtcNow,
+            SourceDurationSeconds = duration
+        };
+        job.SourcePath = sourcePath;
+        return job;
+    }
+
+    private static List<string> BuildCutArgs(string sourcePath, string outputPath, double startSeconds, double keepSeconds)
+    {
+        return new List<string>
+        {
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-ss", startSeconds.ToString("0.###", CultureInfo.InvariantCulture),
+            "-i", sourcePath,
+            "-t", keepSeconds.ToString("0.###", CultureInfo.InvariantCulture),
+            "-map", "0",
+            "-c", "copy",
+            "-map_metadata", "0",
+            outputPath
+        };
+    }
+
+    private static List<string> BuildTranscodeArgs(
+        string sourcePath,
+        string outputPath,
+        string codec,
+        int bitrateKbps,
+        int maxHeight,
+        MediaProbe probe)
+    {
+        var args = new List<string>
+        {
+            "-hide_banner",
+            "-nostdin",
+            "-y"
+        };
+
+        var isAv1 = codec == "av1";
+        if (isAv1)
+        {
+            // libsvtav1: software AV1. UHD 770 can decode AV1 but cannot encode it in hardware.
+            args.AddRange(new[] { "-i", sourcePath });
+        }
+        else
+        {
+            // Intel Quick Sync: decode + encode on the iGPU, keeping frames in GPU memory.
+            args.AddRange(new[]
+            {
+                "-hwaccel", "qsv",
+                "-hwaccel_output_format", "qsv",
+                "-i", sourcePath
+            });
+        }
+
+        var targetSize = GetTargetSize(probe, maxHeight);
+        if (targetSize is { } size)
+        {
+            args.Add("-vf");
+            args.Add(isAv1
+                ? $"scale={size.Width}:{size.Height}"
+                : $"scale_qsv={size.Width}:{size.Height}");
+        }
+
+        args.AddRange(new[]
+        {
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-map_metadata", "0",
+            "-map_chapters", "0",
+            "-c:v", isAv1 ? "libsvtav1" : "hevc_qsv",
+            "-preset", isAv1 ? "8" : "medium",
+            "-b:v", bitrateKbps.ToString(CultureInfo.InvariantCulture) + "k"
+        });
+
+        if (!isAv1)
+        {
+            args.AddRange(new[]
+            {
+                "-maxrate", bitrateKbps.ToString(CultureInfo.InvariantCulture) + "k",
+                "-bufsize", (bitrateKbps * 2).ToString(CultureInfo.InvariantCulture) + "k"
+            });
+        }
+
+        // MP4 needs AAC audio for broad compatibility; DTS/TrueHD cannot be copied into MP4.
+        args.AddRange(new[]
+        {
+            "-c:a", "aac",
+            "-b:a", "192k"
+        });
+
+        var subtitleIndexes = probe.SubtitleIndexes ?? Array.Empty<int>();
+        if (subtitleIndexes.Count > 0)
+        {
+            foreach (var index in subtitleIndexes)
+            {
+                args.Add("-map");
+                args.Add("0:" + index.ToString(CultureInfo.InvariantCulture));
+            }
+
+            // Text subtitles are converted to MP4's mov_text. Bitmap subtitles are skipped.
+            args.AddRange(new[] { "-c:s", "mov_text" });
+        }
+        else
+        {
+            args.Add("-sn");
+        }
+
+        args.AddRange(new[] { "-movflags", "+faststart", outputPath });
+        return args;
+    }
+
+    private static (int Width, int Height)? GetTargetSize(MediaProbe probe, int maxHeight)
+    {
+        if (probe.Width <= 0 || probe.Height <= 0 || probe.Height <= maxHeight)
+        {
+            return null;
+        }
+
+        var width = (int)Math.Round(
+            probe.Width * (double)maxHeight / probe.Height,
+            MidpointRounding.AwayFromZero);
+        width = Math.Max(2, width & ~1);
+        return (width, maxHeight);
+    }
+
+    private static MediaProbe ProbeSource(string sourcePath, string probePath)
+    {
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo(probePath)
+            {
+                ArgumentList =
+                {
+                    "-v", "error",
+                    "-print_format", "json",
+                    "-show_streams",
+                    "-show_format",
+                    sourcePath
+                },
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+
+            if (process is null)
+            {
+                return default;
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+            if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(output))
+            {
+                return default;
+            }
+
+            using var document = JsonDocument.Parse(output);
+            var root = document.RootElement;
+            var duration = 0d;
+            if (root.TryGetProperty("format", out var format)
+                && format.TryGetProperty("duration", out var durationElement)
+                && double.TryParse(durationElement.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsedDuration))
+            {
+                duration = parsedDuration;
+            }
+
+            var width = 0;
+            var height = 0;
+            var subtitleIndexes = new List<int>();
+            if (root.TryGetProperty("streams", out var streams))
+            {
+                foreach (var stream in streams.EnumerateArray())
+                {
+                    var codecType = GetString(stream, "codec_type");
+                    if (codecType == "video" && width == 0)
+                    {
+                        if (stream.TryGetProperty("disposition", out var disposition)
+                            && disposition.TryGetProperty("attached_pic", out var attachedPic)
+                            && attachedPic.TryGetInt32(out var isAttachedPic)
+                            && isAttachedPic == 1)
+                        {
+                            continue;
+                        }
+
+                        if (stream.TryGetProperty("width", out var widthElement)
+                            && widthElement.TryGetInt32(out var parsedWidth))
+                        {
+                            width = parsedWidth;
+                        }
+
+                        if (stream.TryGetProperty("height", out var heightElement)
+                            && heightElement.TryGetInt32(out var parsedHeight))
+                        {
+                            height = parsedHeight;
+                        }
+                    }
+                    else if (codecType == "subtitle")
+                    {
+                        var codecName = GetString(stream, "codec_name");
+                        if (codecName is "subrip" or "ass" or "ssa" or "mov_text" or "webvtt" or "text"
+                            && stream.TryGetProperty("index", out var indexElement)
+                            && indexElement.TryGetInt32(out var index))
+                        {
+                            subtitleIndexes.Add(index);
+                        }
+                    }
+                }
+            }
+
+            return new MediaProbe(duration, width, height, subtitleIndexes);
+        }
+        catch (Exception)
+        {
+            return default;
+        }
+    }
+
+    private static string? GetString(JsonElement element, string name)
+        => element.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : null;
+
+    /// <summary>
+    /// Builds the final and temporary paths for a transcode. The finished file takes over the source name
+    /// with an mp4 container (no codec/container marker in the name), so the source itself is parked as
+    /// "&lt;name&gt;.&lt;ext&gt;.old" when the job succeeds.
+    /// </summary>
+    /// <param name="sourcePath">The source file path.</param>
+    /// <returns>The final path and the temporary work path.</returns>
+    private static (string FinalPath, string WorkPath) CreateTranscodePaths(string sourcePath)
+    {
+        var directory = Path.GetDirectoryName(sourcePath)!;
+        var baseName = Path.GetFileNameWithoutExtension(sourcePath);
+        var candidate = Path.Combine(directory, baseName + ".mp4");
+
+        // When the source is already an mp4 the new file simply replaces it, so the name is not "taken".
+        var finalPath = string.Equals(candidate, sourcePath, StringComparison.Ordinal)
+            ? candidate
+            : GetUniquePath(candidate);
+
+        var workPath = GetUniquePath(Path.Combine(directory, "." + baseName + ".videotools.mp4"));
+        return (finalPath, workPath);
+    }
+
+    private static string GetFreePath(string path)
+    {
+        if (!PathExists(path))
+        {
+            return path;
+        }
+
+        var directory = Path.GetDirectoryName(path)!;
+        var name = Path.GetFileNameWithoutExtension(path);
+        var extension = Path.GetExtension(path);
+        for (var i = 1; i < 1000; i++)
+        {
+            var candidate = Path.Combine(directory, name + " (" + i.ToString(CultureInfo.InvariantCulture) + ")" + extension);
+            if (!PathExists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new IOException("Could not find a free file name.");
+    }
+
+    private static bool PathExists(string path)
+        => System.IO.File.Exists(path) || Directory.Exists(path);
+
+    private static string GetUniquePath(string path)
+    {
+        lock (_pathLock)
+        {
+            if (!System.IO.File.Exists(path) && !_reservedPaths.Contains(path))
+            {
+                _reservedPaths.Add(path);
+                return path;
+            }
+
+            var directory = Path.GetDirectoryName(path)!;
+            var name = Path.GetFileNameWithoutExtension(path);
+            var extension = Path.GetExtension(path);
+            for (var i = 1; i < 1000; i++)
+            {
+                var candidate = Path.Combine(directory, name + "." + i.ToString(CultureInfo.InvariantCulture) + extension);
+                if (!System.IO.File.Exists(candidate) && !_reservedPaths.Contains(candidate))
+                {
+                    _reservedPaths.Add(candidate);
+                    return candidate;
+                }
+            }
+        }
+
+        throw new IOException("Could not find a free output file name.");
+    }
+
+    private void StartJob(VideoToolJobDto job, List<string> args)
+    {
+        _jobs[job.Id] = job;
+        var encoderPath = string.IsNullOrWhiteSpace(_mediaEncoder.EncoderPath) ? "ffmpeg" : _mediaEncoder.EncoderPath;
+
+        lock (_scanLock)
+        {
+            // A new job arrived; postpone the pending folder scan until the queue is idle again.
+            _scanCts?.Cancel();
+            _scanCts = null;
+            _pending.Enqueue(new JobWork(job, args, encoderPath, _libraryMonitor, _logger));
+        }
+
+        UpdateQueuePositions();
+        _pendingSignal.Release();
+        EnsureWorker();
+    }
+
+    private static void EnsureWorker()
+    {
+        lock (_workerLock)
+        {
+            if (_workerStarted)
+            {
+                return;
+            }
+
+            _workerStarted = true;
+        }
+
+        _ = Task.Run(ProcessQueue);
+    }
+
+    private static async Task ProcessQueue()
+    {
+        while (true)
+        {
+            await _pendingSignal.WaitAsync().ConfigureAwait(false);
+
+            while (_pending.TryDequeue(out var work))
+            {
+                if (work.Job.CancelRequested || string.Equals(work.Job.Status, "Canceled", StringComparison.OrdinalIgnoreCase))
+                {
+                    MarkCanceled(work.Job);
+                    continue;
+                }
+
+                work.Job.QueuePosition = null;
+                work.Job.Status = "Running";
+                work.Job.StartedAt = DateTimeOffset.UtcNow;
+                UpdateQueuePositions();
+
+                try
+                {
+                    await RunFfmpegAsync(work).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    if (work.Job.CancelRequested)
+                    {
+                        MarkCanceled(work.Job);
+                    }
+                    else
+                    {
+                        work.Job.Status = "Failed";
+                        work.Job.CompletedAt = DateTimeOffset.UtcNow;
+                        work.Job.Error = ex.Message;
+                        work.Logger.LogError(ex, "Video tool job {JobId} failed", work.Job.Id);
+                    }
+                }
+
+                UpdateQueuePositions();
+                ScheduleScanIfIdle(work.LibraryMonitor, work.Logger);
+            }
+        }
+    }
+
+    private static void AddFolderForScan(string outputPath)
+    {
+        var folder = Path.GetDirectoryName(outputPath);
+        if (string.IsNullOrWhiteSpace(folder))
+        {
+            return;
+        }
+
+        lock (_scanLock)
+        {
+            _foldersToScan.Add(folder);
+        }
+    }
+
+    private static void ScheduleScanIfIdle(ILibraryMonitor libraryMonitor, ILogger logger)
+    {
+        lock (_scanLock)
+        {
+            if (!_pending.IsEmpty || _foldersToScan.Count == 0)
+            {
+                return;
+            }
+
+            _scanCts?.Cancel();
+            var cts = new CancellationTokenSource();
+            _scanCts = cts;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(10), cts.Token).ConfigureAwait(false);
+
+                    List<string> folders;
+                    lock (_scanLock)
+                    {
+                        if (!ReferenceEquals(_scanCts, cts))
+                        {
+                            return;
+                        }
+
+                        folders = _foldersToScan.ToList();
+                        _foldersToScan.Clear();
+                        _scanCts = null;
+                    }
+
+                    foreach (var folder in folders)
+                    {
+                        try
+                        {
+                            libraryMonitor.ReportFileSystemChanged(folder);
+                            logger.LogInformation("Scheduled folder scan after video queue finished: {Folder}", folder);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "Failed to scan folder after video queue finished: {Folder}", folder);
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // A new job was queued before the delay elapsed.
+                }
+                finally
+                {
+                    cts.Dispose();
+                }
+            });
+        }
+    }
+
+    private static void UpdateQueuePositions()
+    {
+        var queuedIds = new HashSet<Guid>();
+        var position = 1;
+        foreach (var work in _pending)
+        {
+            if (!string.Equals(work.Job.Status, "Queued", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            work.Job.QueuePosition = position++;
+            queuedIds.Add(work.Job.Id);
+        }
+
+        foreach (var job in _jobs.Values)
+        {
+            if (job.Status == "Queued" && !queuedIds.Contains(job.Id))
+            {
+                job.QueuePosition = null;
+            }
+        }
+    }
+
+    private static void MarkCanceled(VideoToolJobDto job)
+    {
+        job.Status = "Canceled";
+        job.Progress = null;
+        job.QueuePosition = null;
+        job.CompletedAt = DateTimeOffset.UtcNow;
+
+        var workPath = string.IsNullOrEmpty(job.WorkPath) ? job.OutputPath : job.WorkPath;
+
+        lock (_pathLock)
+        {
+            _reservedPaths.Remove(workPath);
+        }
+
+        try
+        {
+            // Only ever delete the partial output. A previously finished file that happens to sit at
+            // OutputPath must survive, which is only possible for transcodes (cut writes straight to it).
+            var isPartialOutput = string.Equals(job.Kind, "Cut", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(workPath, job.OutputPath, StringComparison.Ordinal);
+            if (isPartialOutput && System.IO.File.Exists(workPath))
+            {
+                System.IO.File.Delete(workPath);
+            }
+        }
+        catch (Exception)
+        {
+            // The file may still be held by ffmpeg; leave it for the next cleanup attempt.
+        }
+    }
+
+    private static async Task RunFfmpegAsync(JobWork work)
+    {
+        var job = work.Job;
+        var startInfo = new ProcessStartInfo(work.EncoderPath)
+        {
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        foreach (var arg in work.Args)
+        {
+            startInfo.ArgumentList.Add(arg);
+        }
+
+        using var process = new Process { StartInfo = startInfo };
+        var errorLines = new LinkedList<string>();
+
+        try
+        {
+            process.Start();
+            _processes[job.Id] = process;
+            job.ProcessId = process.Id;
+
+            if (job.CancelRequested)
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch (Exception)
+                {
+                    // The process may have exited before the cancellation reached it.
+                }
+            }
+
+            var duration = job.SourceDurationSeconds;
+
+            var readTask = Task.Run(async () =>
+            {
+                string? line;
+                while ((line = await process.StandardError.ReadLineAsync().ConfigureAwait(false)) is not null)
+                {
+                    lock (errorLines)
+                    {
+                        errorLines.AddLast(line);
+                        while (errorLines.Count > 40)
+                        {
+                            errorLines.RemoveFirst();
+                        }
+                    }
+
+                    if (duration > 0)
+                    {
+                        var timeIndex = line.IndexOf("time=", StringComparison.Ordinal);
+                        if (timeIndex >= 0)
+                        {
+                            var value = line.AsSpan(timeIndex + 5).Trim();
+                            var spaceIndex = value.IndexOf(' ');
+                            if (spaceIndex > 0)
+                            {
+                                value = value[..spaceIndex];
+                            }
+
+                            if (TimeSpan.TryParse(value, CultureInfo.InvariantCulture, out var elapsed))
+                            {
+                                job.Progress = Math.Clamp(elapsed.TotalSeconds / duration * 100, 0, 100);
+                            }
+                        }
+                    }
+                }
+            });
+
+            await process.WaitForExitAsync().ConfigureAwait(false);
+            await readTask.ConfigureAwait(false);
+
+            if (job.CancelRequested)
+            {
+                MarkCanceled(job);
+                work.Logger.LogInformation("Video tool job {JobId} canceled", job.Id);
+            }
+            else if (process.ExitCode == 0 && System.IO.File.Exists(job.WorkPath))
+            {
+                FinalizeOutput(job);
+                job.Status = "Completed";
+                job.Progress = 100;
+                job.CompletedAt = DateTimeOffset.UtcNow;
+                AddFolderForScan(job.OutputPath);
+                work.Logger.LogInformation("Video tool job {JobId} finished: {OutputPath}", job.Id, job.OutputPath);
+            }
+            else
+            {
+                job.Status = "Failed";
+                job.CompletedAt = DateTimeOffset.UtcNow;
+                lock (errorLines)
+                {
+                    job.Error = string.Join(Environment.NewLine, errorLines);
+                }
+
+                work.Logger.LogError("Video tool job {JobId} failed with exit code {ExitCode}: {Error}", job.Id, process.ExitCode, job.Error);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (job.CancelRequested)
+            {
+                MarkCanceled(job);
+            }
+            else
+            {
+                job.Status = "Failed";
+                job.CompletedAt = DateTimeOffset.UtcNow;
+                job.Error = ex.Message;
+                work.Logger.LogError(ex, "Video tool job {JobId} failed to start", job.Id);
+            }
+        }
+        finally
+        {
+            _processes.TryRemove(job.Id, out _);
+            lock (_pathLock)
+            {
+                if (!string.IsNullOrEmpty(job.WorkPath))
+                {
+                    _reservedPaths.Remove(job.WorkPath);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Moves the finished temporary file into place. For transcodes the original file is kept next to
+    /// the new one with an extra ".old" suffix, so the new file can take over the original name.
+    /// </summary>
+    /// <param name="job">The finished job.</param>
+    private static void FinalizeOutput(VideoToolJobDto job)
+    {
+        if (string.Equals(job.Kind, "Transcode", StringComparison.OrdinalIgnoreCase)
+            && System.IO.File.Exists(job.SourcePath)
+            && !string.Equals(job.SourcePath, job.WorkPath, StringComparison.Ordinal))
+        {
+            var oldPath = GetFreePath(job.SourcePath + ".old");
+            System.IO.File.Move(job.SourcePath, oldPath, overwrite: false);
+        }
+
+        var outputPath = job.OutputPath;
+        if (System.IO.File.Exists(outputPath) && !string.Equals(outputPath, job.WorkPath, StringComparison.Ordinal))
+        {
+            outputPath = GetUniquePath(outputPath);
+        }
+
+        System.IO.File.Move(job.WorkPath, outputPath, overwrite: true);
+        job.OutputPath = outputPath;
+    }
+
+    private readonly record struct MediaProbe(
+        double Duration,
+        int Width,
+        int Height,
+        IReadOnlyList<int> SubtitleIndexes);
+
+    private sealed record JobWork(
+        VideoToolJobDto Job,
+        List<string> Args,
+        string EncoderPath,
+        ILibraryMonitor LibraryMonitor,
+        ILogger Logger);
+}
