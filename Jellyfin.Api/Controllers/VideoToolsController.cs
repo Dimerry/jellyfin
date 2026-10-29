@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Api.Models.VideoToolDtos;
 using MediaBrowser.Common.Api;
+using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using Microsoft.AspNetCore.Authorization;
@@ -86,53 +87,70 @@ public class VideoToolsController : BaseJellyfinApiController
             return NotFound();
         }
 
-        var sourcePath = item.Path;
-        if (string.IsNullOrWhiteSpace(sourcePath) || !System.IO.File.Exists(sourcePath))
+        if (!TryParseTranscodeParams(codec, bitrateKbps, resolution, out var normalizedCodec, out var maxHeight, out var error))
+        {
+            return BadRequest(error);
+        }
+
+        var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight);
+        if (job is null)
         {
             return BadRequest("Item has no local video file.");
         }
 
-        codec = codec.Trim().ToLowerInvariant();
-        if (codec is not ("av1" or "h265" or "hevc"))
-        {
-            return BadRequest("codec must be 'av1' or 'h265'.");
-        }
-
-        if (bitrateKbps < 100 || bitrateKbps > 200000)
-        {
-            return BadRequest("bitrateKbps must be between 100 and 200000.");
-        }
-
-        var maxHeight = resolution.Trim().ToLowerInvariant() switch
-        {
-            "1080p" => 1080,
-            "4k" or "2160p" => 2160,
-            _ => 0
-        };
-        if (maxHeight == 0)
-        {
-            return BadRequest("resolution must be '1080p' or '4k'.");
-        }
-
-        var probe = ProbeSource(
-            sourcePath,
-            string.IsNullOrWhiteSpace(_mediaEncoder.ProbePath) ? "ffprobe" : _mediaEncoder.ProbePath);
-        var duration = probe.Duration > 0
-            ? probe.Duration
-            : TimeSpan.FromTicks(item.RunTimeTicks ?? 0).TotalSeconds;
-
-        var paths = CreateTranscodePaths(sourcePath);
-        var outputPath = paths.FinalPath;
-
-        var job = CreateJob("Transcode", item.Name, outputPath, sourcePath, duration);
-        job.WorkPath = paths.WorkPath;
-        job.Codec = codec == "av1" ? "AV1" : "H.265";
-        job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
-        job.BitrateKbps = bitrateKbps;
-        var (primaryArgs, softwareArgs) =
-            BuildTranscodeCommands(sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, probe);
-        StartJob(job, primaryArgs, softwareArgs);
         return Accepted(job);
+    }
+
+    /// <summary>
+    /// Queues a transcode for several video items using the same settings.
+    /// Items without a local file are skipped and reported back by name.
+    /// </summary>
+    /// <param name="itemIds">The item ids to transcode.</param>
+    /// <param name="codec">Target codec: h265 (default, QSV) or av1 (software, slower).</param>
+    /// <param name="bitrateKbps">Target video bitrate in kbps.</param>
+    /// <param name="resolution">Maximum output resolution: 1080p (default) or 4k.</param>
+    /// <returns>The queued jobs and the names of the items that were skipped.</returns>
+    [HttpPost("Transcode")]
+    public ActionResult<TranscodeBatchResultDto> StartTranscodeBatch(
+        [FromBody] Guid[] itemIds,
+        [FromQuery] string codec = "h265",
+        [FromQuery] int bitrateKbps = 3000,
+        [FromQuery] string resolution = "1080p")
+    {
+        if (itemIds is null || itemIds.Length == 0)
+        {
+            return BadRequest("No items were selected.");
+        }
+
+        if (!TryParseTranscodeParams(codec, bitrateKbps, resolution, out var normalizedCodec, out var maxHeight, out var error))
+        {
+            return BadRequest(error);
+        }
+
+        var result = new TranscodeBatchResultDto();
+        foreach (var itemId in itemIds)
+        {
+            var item = _libraryManager.GetItemById(itemId);
+            if (item is null)
+            {
+                result.SkippedNames.Add(itemId.ToString());
+                continue;
+            }
+
+            var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight);
+            if (job is null)
+            {
+                result.SkippedNames.Add(item.Name);
+                _logger.LogWarning("Skipping transcode of {Name}: no local video file", item.Name);
+                continue;
+            }
+
+            result.Jobs.Add(job);
+        }
+
+        result.Added = result.Jobs.Count;
+        result.Skipped = result.SkippedNames.Count;
+        return Ok(result);
     }
 
     /// <summary>
@@ -580,6 +598,74 @@ public class VideoToolsController : BaseJellyfinApiController
         {
             EnableRangeProcessing = true
         };
+    }
+
+    private static bool TryParseTranscodeParams(
+        string codec,
+        int bitrateKbps,
+        string resolution,
+        out string normalizedCodec,
+        out int maxHeight,
+        out string? error)
+    {
+        normalizedCodec = codec.Trim().ToLowerInvariant();
+        maxHeight = 0;
+        error = null;
+
+        if (normalizedCodec is not ("av1" or "h265" or "hevc"))
+        {
+            error = "codec must be 'av1' or 'h265'.";
+            return false;
+        }
+
+        if (bitrateKbps < 100 || bitrateKbps > 200000)
+        {
+            error = "bitrateKbps must be between 100 and 200000.";
+            return false;
+        }
+
+        maxHeight = resolution.Trim().ToLowerInvariant() switch
+        {
+            "1080p" => 1080,
+            "4k" or "2160p" => 2160,
+            _ => 0
+        };
+
+        if (maxHeight == 0)
+        {
+            error = "resolution must be '1080p' or '4k'.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private VideoToolJobDto? EnqueueTranscode(BaseItem item, string codec, int bitrateKbps, int maxHeight)
+    {
+        var sourcePath = item.Path;
+        if (string.IsNullOrWhiteSpace(sourcePath) || !System.IO.File.Exists(sourcePath))
+        {
+            return null;
+        }
+
+        var probe = ProbeSource(
+            sourcePath,
+            string.IsNullOrWhiteSpace(_mediaEncoder.ProbePath) ? "ffprobe" : _mediaEncoder.ProbePath);
+        var duration = probe.Duration > 0
+            ? probe.Duration
+            : TimeSpan.FromTicks(item.RunTimeTicks ?? 0).TotalSeconds;
+
+        var paths = CreateTranscodePaths(sourcePath);
+
+        var job = CreateJob("Transcode", item.Name, paths.FinalPath, sourcePath, duration);
+        job.WorkPath = paths.WorkPath;
+        job.Codec = codec == "av1" ? "AV1" : "H.265";
+        job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
+        job.BitrateKbps = bitrateKbps;
+        var (primaryArgs, softwareArgs) =
+            BuildTranscodeCommands(sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, probe);
+        StartJob(job, primaryArgs, softwareArgs);
+        return job;
     }
 
     private static VideoToolJobDto CreateJob(string kind, string itemName, string outputPath, string sourcePath, double duration)
