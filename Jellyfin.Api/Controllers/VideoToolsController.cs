@@ -610,10 +610,13 @@ public class VideoToolsController : BaseJellyfinApiController
 
         // -display_rotation is an input option: it rewrites the display matrix, so the
         // stream can still be copied bit-for-bit instead of being re-encoded.
+        // ffmpeg's sign convention is inverted compared to "clockwise on screen":
+        // passing 90 makes players turn the picture 90 degrees counter-clockwise,
+        // so the value has to be mirrored to give the user what they picked.
         if (rotation != 0)
         {
             args.Add("-display_rotation");
-            args.Add(rotation.ToString(CultureInfo.InvariantCulture));
+            args.Add(((360 - rotation) % 360).ToString(CultureInfo.InvariantCulture));
         }
 
         args.AddRange(
