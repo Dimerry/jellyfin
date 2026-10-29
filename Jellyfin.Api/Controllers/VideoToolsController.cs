@@ -124,14 +124,14 @@ public class VideoToolsController : BaseJellyfinApiController
         var paths = CreateTranscodePaths(sourcePath);
         var outputPath = paths.FinalPath;
 
-        var args = BuildTranscodeArgs(sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, probe);
-
         var job = CreateJob("Transcode", item.Name, outputPath, sourcePath, duration);
         job.WorkPath = paths.WorkPath;
         job.Codec = codec == "av1" ? "AV1" : "H.265";
         job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
         job.BitrateKbps = bitrateKbps;
-        StartJob(job, args);
+        var (primaryArgs, softwareArgs) =
+            BuildTranscodeCommands(sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, probe);
+        StartJob(job, primaryArgs, softwareArgs);
         return Accepted(job);
     }
 
@@ -275,14 +275,15 @@ public class VideoToolsController : BaseJellyfinApiController
 
                 var paths = CreateTranscodePaths(failedJob.SourcePath);
                 var outputPath = paths.FinalPath;
-                var args = BuildTranscodeArgs(failedJob.SourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, probe);
 
                 var job = CreateJob("Transcode", failedJob.ItemName, outputPath, failedJob.SourcePath, duration);
                 job.WorkPath = paths.WorkPath;
                 job.Codec = codec == "av1" ? "AV1" : "H.265";
                 job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
                 job.BitrateKbps = bitrateKbps;
-                StartJob(job, args);
+                var (primaryArgs, softwareArgs) =
+                    BuildTranscodeCommands(failedJob.SourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, probe);
+                StartJob(job, primaryArgs, softwareArgs);
                 return Accepted(job);
             }
 
@@ -605,13 +606,56 @@ public class VideoToolsController : BaseJellyfinApiController
         };
     }
 
+    /// <summary>
+    /// Tells whether the iGPU can decode the given codec, i.e. whether the QSV decode pipeline can be
+    /// used for the source.
+    /// </summary>
+    /// <param name="codec">The ffprobe codec name.</param>
+    /// <returns><c>true</c> when Quick Sync can decode it.</returns>
+    private static bool IsHardwareDecodable(string? codec)
+    {
+        return codec switch
+        {
+            "h264" or "hevc" or "av1" or "vp8" or "vp9" or "mpeg2video" or "vc1" or "mjpeg" => true,
+            _ => false
+        };
+    }
+
+    /// <summary>
+    /// Builds the transcode arguments plus an optional software-decode fallback.
+    /// </summary>
+    /// <param name="sourcePath">The source file path.</param>
+    /// <param name="workPath">The temporary output path.</param>
+    /// <param name="codec">The target codec.</param>
+    /// <param name="bitrateKbps">The target bitrate.</param>
+    /// <param name="maxHeight">The maximum output height.</param>
+    /// <param name="probe">The probed source.</param>
+    /// <returns>The primary arguments and the fallback arguments, when a fallback is useful.</returns>
+    private static (List<string> Args, List<string>? SoftwareArgs) BuildTranscodeCommands(
+        string sourcePath,
+        string workPath,
+        string codec,
+        int bitrateKbps,
+        int maxHeight,
+        MediaProbe probe)
+    {
+        var args = BuildTranscodeArgs(sourcePath, workPath, codec, bitrateKbps, maxHeight, probe);
+        var canFallBack = codec != "av1" && IsHardwareDecodable(probe.VideoCodec);
+        var softwareArgs = canFallBack
+            ? BuildTranscodeArgs(sourcePath, workPath, codec, bitrateKbps, maxHeight, probe, forceSoftwareDecode: true)
+            : null;
+
+        return (args, softwareArgs);
+    }
+
     private static List<string> BuildTranscodeArgs(
         string sourcePath,
         string outputPath,
         string codec,
         int bitrateKbps,
         int maxHeight,
-        MediaProbe probe)
+        MediaProbe probe,
+        bool forceSoftwareDecode = false)
     {
         var args = new List<string>
         {
@@ -621,12 +665,13 @@ public class VideoToolsController : BaseJellyfinApiController
         };
 
         var isAv1 = codec == "av1";
+        var useQsvDecoder = !isAv1 && !forceSoftwareDecode && IsHardwareDecodable(probe.VideoCodec);
         if (isAv1)
         {
             // libsvtav1: software AV1. UHD 770 can decode AV1 but cannot encode it in hardware.
             args.AddRange(new[] { "-i", sourcePath });
         }
-        else
+        else if (useQsvDecoder)
         {
             // Intel Quick Sync: decode + encode on the iGPU, keeping frames in GPU memory.
             args.AddRange(new[]
@@ -636,14 +681,20 @@ public class VideoToolsController : BaseJellyfinApiController
                 "-i", sourcePath
             });
         }
+        else
+        {
+            // MPEG-4 Part 2, VC-1 and friends cannot be decoded by Quick Sync; decoding them on the
+            // CPU and uploading the frames for the encoder is much better than failing the job.
+            args.AddRange(new[] { "-i", sourcePath });
+        }
 
         var targetSize = GetTargetSize(probe, maxHeight);
         if (targetSize is { } size)
         {
             args.Add("-vf");
-            args.Add(isAv1
-                ? $"scale={size.Width}:{size.Height}"
-                : $"scale_qsv={size.Width}:{size.Height}");
+            args.Add(useQsvDecoder
+                ? $"scale_qsv={size.Width}:{size.Height}"
+                : $"scale={size.Width}:{size.Height}");
         }
 
         args.AddRange(new[]
@@ -833,6 +884,7 @@ public class VideoToolsController : BaseJellyfinApiController
             var height = 0;
             var frameRate = 0d;
             var nominalFrameRate = 0d;
+            var videoCodec = string.Empty;
             var subtitleIndexes = new List<int>();
             if (root.TryGetProperty("streams", out var streams))
             {
@@ -863,6 +915,7 @@ public class VideoToolsController : BaseJellyfinApiController
 
                         frameRate = ParseFrameRate(stream, "avg_frame_rate");
                         nominalFrameRate = ParseFrameRate(stream, "r_frame_rate");
+                        videoCodec = GetString(stream, "codec_name") ?? string.Empty;
                     }
                     else if (codecType == "subtitle")
                     {
@@ -877,7 +930,7 @@ public class VideoToolsController : BaseJellyfinApiController
                 }
             }
 
-            return new MediaProbe(duration, width, height, subtitleIndexes, frameRate, nominalFrameRate);
+            return new MediaProbe(duration, width, height, subtitleIndexes, frameRate, nominalFrameRate, videoCodec);
         }
         catch (Exception)
         {
@@ -996,7 +1049,7 @@ public class VideoToolsController : BaseJellyfinApiController
         throw new IOException("Could not find a free output file name.");
     }
 
-    private void StartJob(VideoToolJobDto job, List<string> args)
+    private void StartJob(VideoToolJobDto job, List<string> args, List<string>? softwareArgs = null)
     {
         _jobs[job.Id] = job;
         var encoderPath = string.IsNullOrWhiteSpace(_mediaEncoder.EncoderPath) ? "ffmpeg" : _mediaEncoder.EncoderPath;
@@ -1006,7 +1059,7 @@ public class VideoToolsController : BaseJellyfinApiController
             // A new job arrived; postpone the pending folder scan until the queue is idle again.
             _scanCts?.Cancel();
             _scanCts = null;
-            _pending.Enqueue(new JobWork(job, args, encoderPath, _libraryMonitor, _logger));
+            _pending.Enqueue(new JobWork(job, args, encoderPath, _libraryMonitor, _logger, softwareArgs));
         }
 
         UpdateQueuePositions();
@@ -1202,86 +1255,37 @@ public class VideoToolsController : BaseJellyfinApiController
     private static async Task RunFfmpegAsync(JobWork work)
     {
         var job = work.Job;
-        var startInfo = new ProcessStartInfo(work.EncoderPath)
-        {
-            RedirectStandardError = true,
-            RedirectStandardOutput = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-
-        foreach (var arg in work.Args)
-        {
-            startInfo.ArgumentList.Add(arg);
-        }
-
-        using var process = new Process { StartInfo = startInfo };
         var errorLines = new LinkedList<string>();
 
         try
         {
-            process.Start();
-            _processes[job.Id] = process;
-            job.ProcessId = process.Id;
+            var exitCode = await RunProcessAsync(work, work.Args, job, errorLines).ConfigureAwait(false);
 
-            if (job.CancelRequested)
+            if (!job.CancelRequested && exitCode != 0 && work.SoftwareArgs is { } softwareArgs)
             {
-                try
+                // Hardware decoding can fail on sources the iGPU does not accept. Fall back once to a
+                // pure software decode and keep the same encoder settings.
+                work.Logger.LogWarning(
+                    "Video tool job {JobId} failed on the hardware decoder (exit code {ExitCode}), retrying with software decoding",
+                    job.Id,
+                    exitCode);
+
+                TryDeleteWorkFile(job);
+                job.Progress = 0;
+                lock (errorLines)
                 {
-                    process.Kill(entireProcessTree: true);
+                    errorLines.Clear();
                 }
-                catch (Exception)
-                {
-                    // The process may have exited before the cancellation reached it.
-                }
+
+                exitCode = await RunProcessAsync(work, softwareArgs, job, errorLines).ConfigureAwait(false);
             }
-
-            var duration = job.SourceDurationSeconds;
-
-            var readTask = Task.Run(async () =>
-            {
-                string? line;
-                while ((line = await process.StandardError.ReadLineAsync().ConfigureAwait(false)) is not null)
-                {
-                    lock (errorLines)
-                    {
-                        errorLines.AddLast(line);
-                        while (errorLines.Count > 40)
-                        {
-                            errorLines.RemoveFirst();
-                        }
-                    }
-
-                    if (duration > 0)
-                    {
-                        var timeIndex = line.IndexOf("time=", StringComparison.Ordinal);
-                        if (timeIndex >= 0)
-                        {
-                            var value = line.AsSpan(timeIndex + 5).Trim();
-                            var spaceIndex = value.IndexOf(' ');
-                            if (spaceIndex > 0)
-                            {
-                                value = value[..spaceIndex];
-                            }
-
-                            if (TimeSpan.TryParse(value, CultureInfo.InvariantCulture, out var elapsed))
-                            {
-                                job.Progress = Math.Clamp(elapsed.TotalSeconds / duration * 100, 0, 100);
-                            }
-                        }
-                    }
-                }
-            });
-
-            await process.WaitForExitAsync().ConfigureAwait(false);
-            await readTask.ConfigureAwait(false);
 
             if (job.CancelRequested)
             {
                 MarkCanceled(job);
                 work.Logger.LogInformation("Video tool job {JobId} canceled", job.Id);
             }
-            else if (process.ExitCode == 0 && System.IO.File.Exists(job.WorkPath))
+            else if (exitCode == 0 && System.IO.File.Exists(job.WorkPath))
             {
                 FinalizeOutput(job);
                 job.Status = "Completed";
@@ -1299,7 +1303,7 @@ public class VideoToolsController : BaseJellyfinApiController
                     job.Error = string.Join(Environment.NewLine, errorLines);
                 }
 
-                work.Logger.LogError("Video tool job {JobId} failed with exit code {ExitCode}: {Error}", job.Id, process.ExitCode, job.Error);
+                work.Logger.LogError("Video tool job {JobId} failed with exit code {ExitCode}: {Error}", job.Id, exitCode, job.Error);
             }
         }
         catch (Exception ex)
@@ -1326,6 +1330,111 @@ public class VideoToolsController : BaseJellyfinApiController
                     _reservedPaths.Remove(job.WorkPath);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Runs ffmpeg once and feeds its progress into the job.
+    /// </summary>
+    /// <param name="work">The job work item.</param>
+    /// <param name="args">The arguments to pass to ffmpeg.</param>
+    /// <param name="job">The job being updated.</param>
+    /// <param name="errorLines">Collector for the last ffmpeg error lines.</param>
+    /// <returns>The ffmpeg exit code.</returns>
+    private static async Task<int> RunProcessAsync(
+        JobWork work,
+        List<string> args,
+        VideoToolJobDto job,
+        LinkedList<string> errorLines)
+    {
+        var startInfo = new ProcessStartInfo(work.EncoderPath)
+        {
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        foreach (var arg in args)
+        {
+            startInfo.ArgumentList.Add(arg);
+        }
+
+        using var process = new Process { StartInfo = startInfo };
+        process.Start();
+        _processes[job.Id] = process;
+        job.ProcessId = process.Id;
+
+        if (job.CancelRequested)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (Exception)
+            {
+                // The process may have exited before the cancellation reached it.
+            }
+        }
+
+        var duration = job.SourceDurationSeconds;
+
+        var readTask = Task.Run(async () =>
+        {
+            string? line;
+            while ((line = await process.StandardError.ReadLineAsync().ConfigureAwait(false)) is not null)
+            {
+                lock (errorLines)
+                {
+                    errorLines.AddLast(line);
+                    while (errorLines.Count > 40)
+                    {
+                        errorLines.RemoveFirst();
+                    }
+                }
+
+                if (duration > 0)
+                {
+                    var timeIndex = line.IndexOf("time=", StringComparison.Ordinal);
+                    if (timeIndex >= 0)
+                    {
+                        var value = line.AsSpan(timeIndex + 5).Trim();
+                        var spaceIndex = value.IndexOf(' ');
+                        if (spaceIndex > 0)
+                        {
+                            value = value[..spaceIndex];
+                        }
+
+                        if (TimeSpan.TryParse(value, CultureInfo.InvariantCulture, out var elapsed))
+                        {
+                            job.Progress = Math.Clamp(elapsed.TotalSeconds / duration * 100, 0, 100);
+                        }
+                    }
+                }
+            }
+        });
+
+        await process.WaitForExitAsync().ConfigureAwait(false);
+        await readTask.ConfigureAwait(false);
+        return process.ExitCode;
+    }
+
+    /// <summary>
+    /// Removes a partially written work file before a retry.
+    /// </summary>
+    /// <param name="job">The job owning the file.</param>
+    private static void TryDeleteWorkFile(VideoToolJobDto job)
+    {
+        try
+        {
+            if (!string.IsNullOrEmpty(job.WorkPath) && System.IO.File.Exists(job.WorkPath))
+            {
+                System.IO.File.Delete(job.WorkPath);
+            }
+        }
+        catch (Exception)
+        {
+            // The file may still be held by ffmpeg; the next attempt overwrites it anyway.
         }
     }
 
@@ -1361,12 +1470,14 @@ public class VideoToolsController : BaseJellyfinApiController
         int Height,
         IReadOnlyList<int> SubtitleIndexes,
         double FrameRate,
-        double NominalFrameRate);
+        double NominalFrameRate,
+        string VideoCodec);
 
     private sealed record JobWork(
         VideoToolJobDto Job,
         List<string> Args,
         string EncoderPath,
         ILibraryMonitor LibraryMonitor,
-        ILogger Logger);
+        ILogger Logger,
+        List<string>? SoftwareArgs = null);
 }
