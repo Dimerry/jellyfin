@@ -116,6 +116,12 @@ public sealed class VideoToolJobDto
     public double CutEndSeconds { get; set; }
 
     /// <summary>
+    /// Gets or sets the clockwise rotation in degrees applied by a cut job. Not exposed over the API.
+    /// </summary>
+    [JsonIgnore]
+    public int CutRotation { get; set; }
+
+    /// <summary>
     /// Gets or sets the ffmpeg process id. Not exposed over the API.
     /// </summary>
     [JsonIgnore]

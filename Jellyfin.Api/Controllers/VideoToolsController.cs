@@ -142,12 +142,14 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="itemId">The item id.</param>
     /// <param name="startSeconds">Seconds to remove from the start.</param>
     /// <param name="endSeconds">Seconds to remove from the end.</param>
+    /// <param name="rotation">Clockwise rotation in degrees (0, 90, 180 or 270).</param>
     /// <returns>The created job.</returns>
     [HttpPost("{itemId}/Cut")]
     public ActionResult<VideoToolJobDto> StartCut(
         [FromRoute] Guid itemId,
         [FromQuery] double startSeconds = 0,
-        [FromQuery] double endSeconds = 0)
+        [FromQuery] double endSeconds = 0,
+        [FromQuery] int rotation = 0)
     {
         var item = _libraryManager.GetItemById(itemId);
         if (item is null)
@@ -178,17 +180,23 @@ public class VideoToolsController : BaseJellyfinApiController
             return BadRequest("Trim values remove the whole video.");
         }
 
+        if (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270)
+        {
+            return BadRequest("Rotation must be 0, 90, 180 or 270 degrees.");
+        }
+
         var keepSeconds = duration - startSeconds - endSeconds;
         var outputPath = GetUniquePath(Path.Combine(
             Path.GetDirectoryName(sourcePath)!,
             Path.GetFileNameWithoutExtension(sourcePath) + ".cut" + Path.GetExtension(sourcePath)));
 
-        var args = BuildCutArgs(sourcePath, outputPath, startSeconds, keepSeconds);
+        var args = BuildCutArgs(sourcePath, outputPath, startSeconds, keepSeconds, rotation);
 
         var job = CreateJob("Cut", item.Name, outputPath, sourcePath, duration);
         job.WorkPath = outputPath;
         job.CutStartSeconds = startSeconds;
         job.CutEndSeconds = endSeconds;
+        job.CutRotation = rotation;
         StartJob(job, args);
         return Accepted(job);
     }
@@ -305,7 +313,8 @@ public class VideoToolsController : BaseJellyfinApiController
                 job.WorkPath = outputPath;
                 job.CutStartSeconds = startSeconds;
                 job.CutEndSeconds = endSeconds;
-                StartJob(job, BuildCutArgs(failedJob.SourcePath, outputPath, startSeconds, keepSeconds));
+                job.CutRotation = failedJob.CutRotation;
+                StartJob(job, BuildCutArgs(failedJob.SourcePath, outputPath, startSeconds, keepSeconds, failedJob.CutRotation));
                 return Accepted(job);
             }
         }
@@ -589,21 +598,35 @@ public class VideoToolsController : BaseJellyfinApiController
         return job;
     }
 
-    private static List<string> BuildCutArgs(string sourcePath, string outputPath, double startSeconds, double keepSeconds)
+    private static List<string> BuildCutArgs(string sourcePath, string outputPath, double startSeconds, double keepSeconds, int rotation = 0)
     {
-        return new List<string>
+        var args = new List<string>
         {
             "-hide_banner",
             "-nostdin",
             "-y",
-            "-ss", startSeconds.ToString("0.###", CultureInfo.InvariantCulture),
+            "-ss", startSeconds.ToString("0.###", CultureInfo.InvariantCulture)
+        };
+
+        // -display_rotation is an input option: it rewrites the display matrix, so the
+        // stream can still be copied bit-for-bit instead of being re-encoded.
+        if (rotation != 0)
+        {
+            args.Add("-display_rotation");
+            args.Add(rotation.ToString(CultureInfo.InvariantCulture));
+        }
+
+        args.AddRange(
+        [
             "-i", sourcePath,
             "-t", keepSeconds.ToString("0.###", CultureInfo.InvariantCulture),
             "-map", "0",
             "-c", "copy",
             "-map_metadata", "0",
             outputPath
-        };
+        ]);
+
+        return args;
     }
 
     /// <summary>
