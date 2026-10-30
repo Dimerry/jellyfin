@@ -25,6 +25,7 @@ using MediaBrowser.Controller.Extensions;
 using MediaBrowser.XbmcMetadata;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Localization;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Configuration;
@@ -180,6 +181,18 @@ namespace Jellyfin.Server
                 {
                     mainApp.UseDeveloperExceptionPage();
                 }
+
+                // Tools and clients written for Emby prefix every API call with /emby.
+                // Strip that segment so they can talk to this server unchanged.
+                mainApp.Use((context, next) =>
+                {
+                    if (context.Request.Path.StartsWithSegments("/emby", StringComparison.OrdinalIgnoreCase, out var remainingPath))
+                    {
+                        context.Request.Path = remainingPath.HasValue ? remainingPath : new PathString("/");
+                    }
+
+                    return next(context);
+                });
 
                 mainApp.UseForwardedHeaders();
                 mainApp.UseMiddleware<ExceptionMiddleware>();
