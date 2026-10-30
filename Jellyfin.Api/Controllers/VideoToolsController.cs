@@ -37,6 +37,9 @@ public class VideoToolsController : BaseJellyfinApiController
     private static readonly object _scanLock = new();
     private static readonly HashSet<string> _reservedPaths = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> _foldersToScan = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly string FrameCacheDirectory = Path.Combine(Path.GetTempPath(), "jellyfin-videotools-frames");
+    private static readonly SemaphoreSlim _frameLock = new(2, 2);
+    private static readonly double[] BackoffSeconds = [0.5, 1.0, 2.0, 5.0];
     private static CancellationTokenSource? _scanCts;
     private static bool _workerStarted;
 
@@ -598,6 +601,265 @@ public class VideoToolsController : BaseJellyfinApiController
         {
             EnableRangeProcessing = true
         };
+    }
+
+    /// <summary>
+    /// Renders a single video frame as a JPEG, used by the cut dialog to show the first and
+    /// last kept frame while the trim values are edited.
+    /// </summary>
+    /// <param name="itemId">The item id.</param>
+    /// <param name="timeSeconds">Position in the source video, in seconds.</param>
+    /// <param name="maxWidth">Maximum preview width in pixels.</param>
+    /// <param name="rotation">Counter-clockwise rotation to bake into the preview (0, 90, 180 or 270).</param>
+    /// <returns>The JPEG frame.</returns>
+    [HttpGet("{itemId}/Frame")]
+    public async Task<ActionResult> GetFrame(
+        [FromRoute] Guid itemId,
+        [FromQuery] double timeSeconds = 0,
+        [FromQuery] int maxWidth = 480,
+        [FromQuery] int rotation = 0)
+    {
+        var item = _libraryManager.GetItemById(itemId);
+        if (item is null)
+        {
+            return NotFound();
+        }
+
+        var sourcePath = item.Path;
+        if (string.IsNullOrWhiteSpace(sourcePath) || !System.IO.File.Exists(sourcePath))
+        {
+            return BadRequest("Item has no local video file.");
+        }
+
+        if (!double.IsFinite(timeSeconds) || timeSeconds < 0)
+        {
+            return BadRequest("timeSeconds must be zero or positive.");
+        }
+
+        if (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270)
+        {
+            return BadRequest("Rotation must be 0, 90, 180 or 270 degrees.");
+        }
+
+        maxWidth = Math.Clamp(maxWidth, 80, 1280);
+
+        var duration = TimeSpan.FromTicks(item.RunTimeTicks ?? 0).TotalSeconds;
+        if (duration > 0)
+        {
+            // Stay just inside the last frame instead of asking for a position ffmpeg cannot render.
+            timeSeconds = Math.Min(timeSeconds, Math.Max(0, duration - 0.3));
+        }
+
+        if (!Directory.Exists(FrameCacheDirectory))
+        {
+            Directory.CreateDirectory(FrameCacheDirectory);
+        }
+
+        var modified = System.IO.File.GetLastWriteTimeUtc(sourcePath).Ticks;
+        var cacheName = string.Format(
+            CultureInfo.InvariantCulture,
+            "{0:N}_{1}_{2}_{3}_{4}.jpg",
+            itemId,
+            modified,
+            maxWidth,
+            rotation,
+            timeSeconds.ToString("0.###", CultureInfo.InvariantCulture).Replace('.', 'p'));
+        var cachePath = Path.Combine(FrameCacheDirectory, cacheName);
+
+        if (!System.IO.File.Exists(cachePath))
+        {
+            await _frameLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (!System.IO.File.Exists(cachePath))
+                {
+                    var width = ComputePreviewWidth(sourcePath, maxWidth, rotation);
+                    var error = await RenderFrameAsync(sourcePath, timeSeconds, width, rotation, cachePath).ConfigureAwait(false);
+                    if (error is not null && timeSeconds > 0)
+                    {
+                        // The reported duration can be slightly longer than the last decodable frame;
+                        // step back a little before giving up.
+                        foreach (var backoff in BackoffSeconds)
+                        {
+                            var retryTime = Math.Max(0, timeSeconds - backoff);
+                            error = await RenderFrameAsync(sourcePath, retryTime, width, rotation, cachePath).ConfigureAwait(false);
+                            if (error is null)
+                            {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (error is not null)
+                    {
+                        _logger.LogWarning("Frame preview failed for {Path}: {Error}", sourcePath, error);
+                        return BadRequest("Could not render the frame.");
+                    }
+
+                    PruneFrameCache();
+                }
+            }
+            finally
+            {
+                _frameLock.Release();
+            }
+        }
+
+        Response.Headers["Cache-Control"] = "private, max-age=600";
+        return PhysicalFile(cachePath, "image/jpeg");
+    }
+
+    /// <summary>
+    /// Picks the preview width, taking the rotation into account so a portrait preview is not upscaled.
+    /// </summary>
+    private int ComputePreviewWidth(string sourcePath, int maxWidth, int rotation)
+    {
+        var probe = ProbeSource(
+            sourcePath,
+            string.IsNullOrWhiteSpace(_mediaEncoder.ProbePath) ? "ffprobe" : _mediaEncoder.ProbePath);
+
+        var width = rotation is 90 or 270 ? probe.Height : probe.Width;
+        if (width <= 0)
+        {
+            return maxWidth;
+        }
+
+        var target = Math.Min(maxWidth, width);
+        return target < 2 ? 2 : target & ~1;
+    }
+
+    /// <summary>
+    /// Runs ffmpeg to write one frame at the given position as a JPEG.
+    /// </summary>
+    /// <returns><c>null</c> on success, otherwise the last ffmpeg error output.</returns>
+    private async Task<string?> RenderFrameAsync(
+        string sourcePath,
+        double timeSeconds,
+        int width,
+        int rotation,
+        string outputPath)
+    {
+        var encoderPath = string.IsNullOrWhiteSpace(_mediaEncoder.EncoderPath) ? "ffmpeg" : _mediaEncoder.EncoderPath;
+        var filters = new List<string>();
+        switch (rotation)
+        {
+            case 90:
+                filters.Add("transpose=2");
+                break;
+            case 180:
+                filters.Add("transpose=2");
+                filters.Add("transpose=2");
+                break;
+            case 270:
+                filters.Add("transpose=1");
+                break;
+        }
+
+        filters.Add("scale=" + width.ToString(CultureInfo.InvariantCulture) + ":-2");
+
+        var args = new List<string>
+        {
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-ss", timeSeconds.ToString("0.###", CultureInfo.InvariantCulture),
+            "-i", sourcePath,
+            "-frames:v", "1",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf", string.Join(',', filters),
+            "-q:v", "4",
+            "-update", "1",
+            "-f", "image2",
+            outputPath
+        };
+
+        var startInfo = new ProcessStartInfo(encoderPath)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        foreach (var arg in args)
+        {
+            startInfo.ArgumentList.Add(arg);
+        }
+
+        using var process = Process.Start(startInfo);
+        if (process is null)
+        {
+            return "ffmpeg could not be started.";
+        }
+
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                process.Kill(true);
+            }
+            catch
+            {
+                // Ignore: the process is already gone.
+            }
+
+            return "ffmpeg timed out.";
+        }
+
+        var stderr = await stderrTask.ConfigureAwait(false);
+        if (process.ExitCode != 0 || !System.IO.File.Exists(outputPath) || new FileInfo(outputPath).Length == 0)
+        {
+            try
+            {
+                System.IO.File.Delete(outputPath);
+            }
+            catch
+            {
+                // Ignore cleanup failures.
+            }
+
+            return string.IsNullOrWhiteSpace(stderr) ? "ffmpeg exited with code " + process.ExitCode : stderr.Trim();
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Deletes the oldest cached preview frames once the cache grows past a few hundred files.
+    /// </summary>
+    private static void PruneFrameCache()
+    {
+        try
+        {
+            var files = new DirectoryInfo(FrameCacheDirectory).GetFiles("*.jpg");
+            if (files.Length <= 400)
+            {
+                return;
+            }
+
+            foreach (var file in files.OrderByDescending(f => f.LastWriteTimeUtc).Skip(200))
+            {
+                try
+                {
+                    file.Delete();
+                }
+                catch
+                {
+                    // Ignore files that are still being served.
+                }
+            }
+        }
+        catch
+        {
+            // Cache pruning is best effort only.
+        }
     }
 
     private static bool TryParseTranscodeParams(
