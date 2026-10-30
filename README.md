@@ -3,7 +3,7 @@
 > **这是 [jellyfin/jellyfin](https://github.com/jellyfin/jellyfin) 的个人 fork，不是官方版本，也不打算给上游提 PR。**
 > 所有改动都在 `videotools` 分支上。
 
-一句话概括：给 Jellyfin 加了**转码 / 掐头去尾**、**后台任务队列**、**剪辑预览抽帧**、**按文件大小、比特率排序**。
+一句话概括：给 Jellyfin 加了**转码 / 掐头去尾**、**视频和图片旋转**、**后台任务队列**、**剪辑预览抽帧**、**按文件大小、比特率排序**。
 
 > 🤖 **本仓库全部代码由 AI 编写。**
 > 作者是一位看不懂代码的天才程序员——需求、交互、审美和验收是他，敲键盘的是 AI。
@@ -34,13 +34,21 @@
 
 - `POST /VideoTools/{itemId}/Cut?startSeconds=2&endSeconds=3&rotation=0|90|180|270`
 - `-ss` 输入端 + `-c copy` 流复制，秒完成、无损。
-- 旋转用 `-display_rotation`（放在 `-i` 之前）重写 display matrix，仍然是流复制，不重编码。
+- **旋转**：`rotation` 传 0 / 90 / 180 / 270（逆时针）。用 `-display_rotation`（放在 `-i` 之前）重写 display matrix，配合 `-c copy` 依然是流复制，**不重编码、秒完成**，画面无损。
+  注意它是绝对设置：源文件自带旋转元数据（手机竖拍）时会被覆盖成所选角度，而不是叠加。
 
 **剪辑预览（抽帧）**
 
 - `GET /VideoTools/{itemId}/Frame?timeSeconds=&maxWidth=480&rotation=0|90|180|270` → 单帧 JPEG。
 - 不进任务队列，单帧 0.1~0.3s；`SemaphoreSlim(2)` 限流，避免拖慢实时转码。
 - 按 `<itemId>_<源文件mtime>_<宽>_<旋转>_<时间>` 缓存到临时目录，命中约 2ms；超过 400 个自动清到 200 个。
+
+**图片旋转**
+
+- `POST /ImageTools/{itemId}/Rotate?degrees=90|180|270`：单张旋转。
+- `POST /ImageTools/Rotate?degrees=90` + body `["guid","guid"]`：批量旋转（多选菜单用这个），逐张串行处理并返回每张的结果。
+- 只接受 `Photo` 类型；用 ffmpeg `transpose` 滤镜**原地重写文件**（JPEG 质量 2、PNG 无损、WebP libwebp 95），旋转后重新排一次刷新任务，让数据库里的分辨率和缩略图跟上新像素。
+- 旋转和转码共用一把锁，避免同时改写同一个文件。
 
 **任务队列**
 
@@ -66,7 +74,13 @@
   修的是 `.avi`(mpeg4/DivX) 直接失败的问题：QSV 解不了 mpeg4，会静默回退成 yuv420p，而 `scale_qsv` 只吃 QSV surface → 滤镜链整体失败。
 - 剪辑时长优先用 ffmpeg 探测的真实时长，探测不到才用数据库里的 `RunTimeTicks`（刚剪过的文件数据库时长是旧的）。
 
-### 4. 排序增强
+### 4. 孤儿文件清理任务（控制台 → 计划任务）
+
+- `Emby.Server.Implementations/ScheduledTasks/Tasks/OrphanFileCleanupTask.cs`，默认 30 天跑一次。
+- 遍历所有媒体库目录，把「已经没有对应媒体文件」的附属文件（poster / fanart / 字幕 / nfo 等）**移动到数据目录下按日期命名的隔离文件夹**，不直接删除，随时可以捞回来。
+- 一天以内的新文件不动，目录级（文件夹本身）的图片永远不动。
+
+### 5. 排序增强
 
 - `Jellyfin.Data/Enums/ItemSortBy.cs` 新增 `Size = 30`。
 - `OrderMapper.cs` 映射 `ItemSortBy.Size → e.Size`。
