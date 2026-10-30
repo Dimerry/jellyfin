@@ -158,7 +158,8 @@ public class VideoToolsController : BaseJellyfinApiController
 
     /// <summary>
     /// Starts a background job that cuts the given number of seconds from the start and the end of a video item,
-    /// keeping the middle part. The output is written next to the source file as "&lt;name&gt;.cut&lt;ext&gt;".
+    /// keeping the middle part. The result takes over the original file name, and the original is kept as
+    /// "&lt;name&gt;.old&lt;ext&gt;".
     /// </summary>
     /// <param name="itemId">The item id.</param>
     /// <param name="startSeconds">Seconds to remove from the start.</param>
@@ -184,7 +185,12 @@ public class VideoToolsController : BaseJellyfinApiController
             return BadRequest("Item has no local video file.");
         }
 
-        var duration = TimeSpan.FromTicks(item.RunTimeTicks ?? 0).TotalSeconds;
+        var probe = ProbeSource(
+            sourcePath,
+            string.IsNullOrWhiteSpace(_mediaEncoder.ProbePath) ? "ffprobe" : _mediaEncoder.ProbePath);
+        var duration = probe.Duration > 0
+            ? probe.Duration
+            : TimeSpan.FromTicks(item.RunTimeTicks ?? 0).TotalSeconds;
         if (duration <= 0)
         {
             return BadRequest("Item duration is unknown.");
@@ -207,14 +213,12 @@ public class VideoToolsController : BaseJellyfinApiController
         }
 
         var keepSeconds = duration - startSeconds - endSeconds;
-        var outputPath = GetUniquePath(Path.Combine(
-            Path.GetDirectoryName(sourcePath)!,
-            Path.GetFileNameWithoutExtension(sourcePath) + ".cut" + Path.GetExtension(sourcePath)));
+        var paths = CreateCutPaths(sourcePath);
 
-        var args = BuildCutArgs(sourcePath, outputPath, startSeconds, keepSeconds, rotation);
+        var args = BuildCutArgs(sourcePath, paths.WorkPath, startSeconds, keepSeconds, rotation);
 
-        var job = CreateJob("Cut", item.Name, outputPath, sourcePath, duration);
-        job.WorkPath = outputPath;
+        var job = CreateJob("Cut", item.Name, paths.FinalPath, sourcePath, duration);
+        job.WorkPath = paths.WorkPath;
         job.CutStartSeconds = startSeconds;
         job.CutEndSeconds = endSeconds;
         job.CutRotation = rotation;
@@ -326,16 +330,14 @@ public class VideoToolsController : BaseJellyfinApiController
                 }
 
                 var keepSeconds = duration - startSeconds - endSeconds;
-                var outputPath = GetUniquePath(Path.Combine(
-                    Path.GetDirectoryName(failedJob.SourcePath)!,
-                    Path.GetFileNameWithoutExtension(failedJob.SourcePath) + ".cut" + Path.GetExtension(failedJob.SourcePath)));
+                var paths = CreateCutPaths(failedJob.SourcePath);
 
-                var job = CreateJob("Cut", failedJob.ItemName, outputPath, failedJob.SourcePath, duration);
-                job.WorkPath = outputPath;
+                var job = CreateJob("Cut", failedJob.ItemName, paths.FinalPath, failedJob.SourcePath, duration);
+                job.WorkPath = paths.WorkPath;
                 job.CutStartSeconds = startSeconds;
                 job.CutEndSeconds = endSeconds;
                 job.CutRotation = failedJob.CutRotation;
-                StartJob(job, BuildCutArgs(failedJob.SourcePath, outputPath, startSeconds, keepSeconds, failedJob.CutRotation));
+                StartJob(job, BuildCutArgs(failedJob.SourcePath, paths.WorkPath, startSeconds, keepSeconds, failedJob.CutRotation));
                 return Accepted(job);
             }
         }
@@ -1339,6 +1341,23 @@ public class VideoToolsController : BaseJellyfinApiController
     }
 
     /// <summary>
+    /// Builds the final and temporary paths for a cut. The new file takes over the source name (same container),
+    /// so the original is parked as "&lt;name&gt;.old&lt;ext&gt;" when the job succeeds.
+    /// </summary>
+    /// <param name="sourcePath">The source file path.</param>
+    /// <returns>The final path and the temporary work path.</returns>
+    private static (string FinalPath, string WorkPath) CreateCutPaths(string sourcePath)
+    {
+        var directory = Path.GetDirectoryName(sourcePath)!;
+        var baseName = Path.GetFileNameWithoutExtension(sourcePath);
+        var extension = Path.GetExtension(sourcePath);
+
+        var finalPath = Path.Combine(directory, Path.GetFileName(sourcePath));
+        var workPath = GetUniquePath(Path.Combine(directory, "." + baseName + ".videotools.cut" + extension));
+        return (finalPath, workPath);
+    }
+
+    /// <summary>
     /// Builds the path that keeps the original file after a transcode, e.g. "clip.mp4" becomes
     /// "clip.old.mp4". A numbered marker is inserted when a backup already exists.
     /// </summary>
@@ -1611,9 +1630,8 @@ public class VideoToolsController : BaseJellyfinApiController
         try
         {
             // Only ever delete the partial output. A previously finished file that happens to sit at
-            // OutputPath must survive, which is only possible for transcodes (cut writes straight to it).
-            var isPartialOutput = string.Equals(job.Kind, "Cut", StringComparison.OrdinalIgnoreCase)
-                || !string.Equals(workPath, job.OutputPath, StringComparison.Ordinal);
+            // OutputPath must survive; that is why the work file is compared against it.
+            var isPartialOutput = !string.Equals(workPath, job.OutputPath, StringComparison.Ordinal);
             if (isPartialOutput && System.IO.File.Exists(workPath))
             {
                 System.IO.File.Delete(workPath);
@@ -1676,6 +1694,8 @@ public class VideoToolsController : BaseJellyfinApiController
                     job.Error = string.Join(Environment.NewLine, errorLines);
                 }
 
+                // Do not leave a hidden half-written file behind; a retry starts from scratch.
+                TryDeleteWorkFile(job);
                 work.Logger.LogError("Video tool job {JobId} failed with exit code {ExitCode}: {Error}", job.Id, exitCode, job.Error);
             }
         }
@@ -1812,14 +1832,14 @@ public class VideoToolsController : BaseJellyfinApiController
     }
 
     /// <summary>
-    /// Moves the finished temporary file into place. For transcodes the original file is kept next to
-    /// the new one with an ".old" marker before its extension, so the new file can take over the
-    /// original name.
+    /// Moves the finished temporary file into place. The original file is kept next to the new one with an
+    /// ".old" marker before its extension, so the new file can take over the original name (transcodes
+    /// always do, cuts keep the same container and therefore the same name).
     /// </summary>
     /// <param name="job">The finished job.</param>
     private static void FinalizeOutput(VideoToolJobDto job)
     {
-        if (string.Equals(job.Kind, "Transcode", StringComparison.OrdinalIgnoreCase)
+        if (job.Kind is "Transcode" or "Cut"
             && System.IO.File.Exists(job.SourcePath)
             && !string.Equals(job.SourcePath, job.WorkPath, StringComparison.Ordinal))
         {
