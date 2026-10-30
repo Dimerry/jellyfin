@@ -3,7 +3,7 @@
 > **这是 [jellyfin/jellyfin](https://github.com/jellyfin/jellyfin) 的个人 fork，不是官方版本，也不打算给上游提 PR。**
 > 所有改动都在 `videotools` 分支上。
 
-一句话概括：给 Jellyfin 加了**转码 / 掐头去尾**、**视频和图片旋转**、**后台任务队列**、**剪辑预览抽帧**、**按文件大小、比特率排序**。
+一句话概括：给 Jellyfin 加了**转码 / 掐头去尾**、**视频和图片旋转**、**后台任务队列**、**剪辑预览抽帧**、**按文件大小、比特率排序**，另外补了个 **Emby 兼容层**让第三方 Emby 工具能直连。
 
 > 🤖 **本仓库全部代码由 AI 编写。**
 > 作者是一位看不懂代码的天才程序员——需求、交互、审美和验收是他，敲键盘的是 AI。
@@ -80,7 +80,13 @@
 - 遍历所有媒体库目录，把「已经没有对应媒体文件」的附属文件（poster / fanart / 字幕 / nfo 等）**移动到数据目录下按日期命名的隔离文件夹**，不直接删除，随时可以捞回来。
 - 一天以内的新文件不动，目录级（文件夹本身）的图片永远不动。
 
-### 5. 排序增强
+### 5. Emby 兼容层
+
+- Jellyfin 本身没有 `/emby` 路由前缀，而按 Emby 写的第三方工具（刮削器、统计脚本、Emby 客户端）所有请求都带这个前缀。`Jellyfin.Server/Startup.cs` 里加了一个中间件，路由前把 `/emby` 段剥掉（大小写不敏感），这类工具不用改配置就能直连。
+- **注意**：Jellyfin 13 的迁移 `DisableLegacyAuthorization` 默认关闭了旧式认证，`X-Emby-Token` / `X-MediaBrowser-Token` / `api_key=` 查询参数会全部返回 401。这类工具要用起来，需要把数据目录 `config/system.xml` 里的 `EnableLegacyAuthorization` 改成 `true`（冒烟测试用 `api_key=` 查 `/emby/Persons` 即可）。
+- 代价是 API key 允许通过 URL 查询参数传递，会出现在日志 / 代理日志里（Jellyfin 自己会把中间几位打码）。局域网自用够用，公网部署请自行权衡。
+
+### 6. 排序增强
 
 - `Jellyfin.Data/Enums/ItemSortBy.cs` 新增 `Size = 30`。
 - `OrderMapper.cs` 映射 `ItemSortBy.Size → e.Size`。
