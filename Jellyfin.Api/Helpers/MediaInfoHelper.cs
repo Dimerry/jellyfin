@@ -202,6 +202,17 @@ public class MediaInfoHelper
     {
         var streamBuilder = new StreamBuilder(_mediaEncoder, _logger);
 
+        // Some MP4 files carry B-frames but no composition time offsets (ctts), so their
+        // timestamps follow decode order. Players that trust container timestamps drop frames
+        // and stutter; force a real video re-encode (a plain remux keeps the broken timeline).
+        if (enableTranscoding
+            && Mp4TimingInspector.ShouldForceTranscode(mediaSource.Path, _mediaEncoder, _logger))
+        {
+            mediaSource.SupportsDirectPlay = false;
+            mediaSource.SupportsDirectStream = false;
+            allowVideoStreamCopy = false;
+        }
+
         var options = new MediaOptions
         {
             MediaSources = new[] { mediaSource },

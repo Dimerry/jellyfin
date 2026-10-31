@@ -102,6 +102,15 @@
 - `OrderMapper.cs` 映射 `ItemSortBy.Size → e.Size`。
 - 新增 `SizeComparer`、`BitrateComparer` 内存排序比较器（自动注册）。
 
+### 7. 时间戳损坏的 MP4 自动转码（`Jellyfin.Api/Helpers/Mp4TimingInspector.cs`）
+
+- 问题：有些 MP4 的视频轨**没有 `ctts`（composition time offset）表**，但码流里明明有 B 帧重排（B-pyramid）。这种文件只能提供“解码顺序”的时间戳，播放器按容器时间戳出帧就会不停丢帧/等帧，表现为**直连播放卡顿掉帧**，而实时转码反而流畅（转码会重建时间轴）。`ffmpeg -c copy` 重封装修不了，必须重编码。
+- 做法：生成播放信息时（`MediaInfoHelper.SetDeviceSpecificData`）解析 MP4 的 box 树，若「视频轨没有 `ctts`」且「ffprobe 报告 `has_b_frames > 0`」，就把 `SupportsDirectPlay` / `SupportsDirectStream` 设为 false 并加 `allowVideoStreamCopy=false`，**强制真正的视频重编码**（只重封装不解决问题）。
+- 只探测一次并缓存（path + mtime + size），有 `ctts` 的文件直接返回不启动进程；分片 MP4（moof）和 mkv/其它容器不受影响。
+- 命中时会打一条日志：`MP4 file ... has B-frames but no composition time offsets (ctts); direct play disabled`。
+- 开关：环境变量 `VIDEOTOOLS_NO_CTTS_TRANSCODE=0` 可关闭这套自动转码。
+- 背景数据：本机 12265 个 mp4 里查出 810 个（92.7 GB）带这个毛病，基本都是某个“无损转封装”工具做出来的；扫描脚本 `scripts/scan-ctts.py`。
+
 ---
 
 ## 二、构建与运行
