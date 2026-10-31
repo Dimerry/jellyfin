@@ -144,6 +144,33 @@ The server is expected to host the web client, but the provided content director
 
 > 默认端口 8096；作者本机跑在 8196，纯属习惯。
 
+### 打包成 .deb（推荐给不想装 .NET 的人）
+
+```bash
+export WEB_DIR=/path/to/jellyfin-web/dist   # 可选，默认 ../jellyfin-web/dist
+./packaging/deb/build.sh                   # 产物：dist/jellyfin-videotools_<版本>_amd64.deb
+```
+
+包是**自包含**的（.NET 运行时一起打进去，约 84MB），目标机器不需要装 SDK/运行时；ffmpeg 用系统的（`Depends: ffmpeg`）。
+
+安装后：
+
+| 项目 | 路径 / 名称 |
+| --- | --- |
+| 程序 | `/opt/jellyfin-videotools/`（含内置 `jellyfin-web`） |
+| 启动器 | `/usr/bin/jellyfin-videotools` |
+| 服务 | `systemctl status jellyfin-videotools` |
+| 配置 | `/etc/jellyfin-videotools`（`/etc/default/jellyfin-videotools` 改目录/参数） |
+| 数据 | `/var/lib/jellyfin-videotools` |
+| 缓存 / 日志 | `/var/cache/jellyfin-videotools`、`/var/log/jellyfin-videotools` |
+| 端口 | 8096（首次启动后可在控制台改） |
+
+安装时自动建 `jellyfin-videotools` 系统用户，并加入 `video`、`render` 组（存在才加），所以 QSV 开箱能用。
+`dpkg --purge` 默认**保留**媒体库数据库（`JELLYFIN_PURGE_DATA=1 dpkg --purge ...` 才删）。
+
+**系统要求**：x86-64，Debian 12+ / Ubuntu 22.04+（glibc ≥ 2.33）。
+自包含包里的 `libe_sqlite3.so` 是拿新 glibc 编译的，在 Debian 11 这种老系统上会在启动时抦在 `DllNotFoundException: e_sqlite3`，不是配置问题。
+
 ---
 
 ## 三、免责声明

@@ -1,0 +1,45 @@
+#!/bin/sh
+set -e
+
+NAME=jellyfin-videotools
+
+if [ "$1" = "configure" ]; then
+    if ! getent group "$NAME" >/dev/null; then
+        addgroup --system "$NAME" >/dev/null
+    fi
+
+    if ! getent passwd "$NAME" >/dev/null; then
+        adduser --system \
+            --home "/var/lib/$NAME" \
+            --ingroup "$NAME" \
+            --disabled-password \
+            --disabled-login \
+            --gecos "Jellyfin VideoTools" \
+            "$NAME" >/dev/null
+    fi
+
+    # Hardware transcoding: Intel QSV needs /dev/dri/renderD128 (render group),
+    # legacy VA-API needs video. Missing groups are simply skipped.
+    for grp in video render; do
+        if getent group "$grp" >/dev/null; then
+            usermod -aG "$grp" "$NAME" >/dev/null 2>&1 || true
+        fi
+    done
+
+    install -d -o "$NAME" -g "$NAME" -m 0755 "/var/lib/$NAME"
+    install -d -o "$NAME" -g "$NAME" -m 0755 "/var/cache/$NAME"
+    install -d -o "$NAME" -g "$NAME" -m 0755 "/var/log/$NAME"
+    if [ ! -d "/etc/$NAME" ]; then
+        install -d -o "$NAME" -g "$NAME" -m 0755 "/etc/$NAME"
+    else
+        chown "$NAME:$NAME" "/etc/$NAME" || true
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable "$NAME.service" >/dev/null 2>&1 || true
+        systemctl restart "$NAME.service" >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

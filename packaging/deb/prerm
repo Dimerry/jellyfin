@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+NAME=jellyfin-videotools
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl stop "$NAME.service" >/dev/null 2>&1 || true
+            if [ "$1" = "remove" ]; then
+                systemctl disable "$NAME.service" >/dev/null 2>&1 || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

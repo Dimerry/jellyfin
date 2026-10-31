@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+NAME=jellyfin-videotools
+
+if [ "$1" = "purge" ]; then
+    rm -rf "/var/cache/$NAME" "/var/log/$NAME"
+    rm -f "/etc/default/$NAME"
+    # The media database is expensive to rebuild; only drop it when explicitly asked.
+    if [ "${JELLYFIN_PURGE_DATA:-0}" = "1" ]; then
+        rm -rf "/var/lib/$NAME" "/etc/$NAME"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+fi
+
+if [ "$1" = "purge" ] && getent passwd "$NAME" >/dev/null; then
+    deluser --system "$NAME" >/dev/null 2>&1 || true
+    delgroup --system "$NAME" >/dev/null 2>&1 || true
+fi
+
+exit 0

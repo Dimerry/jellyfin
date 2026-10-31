@@ -1,0 +1,28 @@
+[Unit]
+Description=Jellyfin VideoTools media server
+Documentation=https://github.com/Dimerry/jellyfin-videotools
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/jellyfin-videotools
+User=jellyfin-videotools
+Group=jellyfin-videotools
+ExecStart=/usr/bin/jellyfin-videotools --service
+# systemd starts system services with HOME=/ which is not writable; Jellyfin creates
+# cache paths from it and dies with UnauthorizedAccessException, so pin it explicitly.
+Environment=HOME=/var/lib/jellyfin-videotools
+Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=20
+StateDirectory=jellyfin-videotools
+CacheDirectory=jellyfin-videotools
+LogsDirectory=jellyfin-videotools
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+Package: jellyfin-videotools
+Version: 12.4.1
+Section: misc
+Priority: optional
+Architecture: amd64
+Depends: ffmpeg, adduser, libicu72 | libicu71 | libicu70, libssl3 | libssl1.1
+Recommends: vainfo
+Maintainer: Dimerry <dimerry@users.noreply.github.com>
+Homepage: https://github.com/Dimerry/jellyfin-videotools
+Description: Jellyfin media server fork with video transcode and cut tools
+ A self-contained build of the Jellyfin 12.4 fork that adds:
+  * transcode a video to H.265 or AV1 from the context menu, picking Intel QSV,
+    NVIDIA NVENC or software encoding automatically,
+  * cut a clip (trim start/end, rotate) with stream copy,
+  * a background job queue with progress, retry and cancel,
+  * sorting by bitrate and file size, image rotation, and an /emby
+    compatibility layer for tools written against the Emby API.
+ .
+ The .NET runtime is bundled, so no .NET installation is required. ffmpeg is
+ used from the system package.
