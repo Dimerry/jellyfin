@@ -1,181 +1,157 @@
-<h1 align="center">Jellyfin</h1>
-<h3 align="center">The Free Software Media System</h3>
+# Jellyfin 魔改版（服务端）
+
+> **这是 [jellyfin/jellyfin](https://github.com/jellyfin/jellyfin) 的个人 fork，不是官方版本，也不打算给上游提 PR。**
+> 所有改动都在 `videotools-12.4` 分支上（旧的 master/13.0 实验分支保留为 `videotools`）。
+
+**基线：上游 Jellyfin `v12.4`（2026-10-26 稳定版）。**
+本仓库版本号 `12.4.1`：**主次版本号必须跟上游一致**，只在自己迭代时递增末位。
+原因：Jellyfin 客户端会把服务端版本号和功能下限做比较，写成 `0.1.0` 会被当成上古服务器，功能被降级甚至拒绝连接。
+
+一句话概括：给 Jellyfin 加了**转码 / 掐头去尾**、**视频和图片旋转**、**后台任务队列**、**剪辑预览抽帧**、**按文件大小、比特率排序**，另外补了个 **Emby 兼容层**让第三方 Emby 工具能直连。
+
+> 🤖 **本仓库全部代码由 AI 编写。**
+> 作者是一位看不懂代码的天才程序员——需求、交互、审美和验收是他，敲键盘的是 AI。
+
+配套前端：[Dimerry/jellyfin-web](https://github.com/Dimerry/jellyfin-web)（分支 `videotools-12.4`，同样基于 `v12.4`；**服务端和前端必须用同一 tag 的一对**，混搭会白屏或接口 404）。
 
 ---
 
-<p align="center">
-<img alt="Logo Banner" src="https://raw.githubusercontent.com/jellyfin/jellyfin-ux/master/branding/SVG/banner-logo-solid.svg?sanitize=true"/>
-<br/>
-<br/>
-<a href="https://github.com/jellyfin/jellyfin"><img alt="GPL 2.0 License" src="https://img.shields.io/github/license/jellyfin/jellyfin.svg"/></a>
-<a href="https://github.com/jellyfin/jellyfin/releases"><img alt="Current Release" src="https://img.shields.io/github/release/jellyfin/jellyfin.svg"/></a>
-<a href="https://translate.jellyfin.org/projects/jellyfin/jellyfin-core/?utm_source=widget"><img alt="Translation Status" src="https://translate.jellyfin.org/widgets/jellyfin/-/jellyfin-core/svg-badge.svg"/></a>
-<a href="https://hub.docker.com/r/jellyfin/jellyfin"><img alt="Docker Pull Count" src="https://img.shields.io/docker/pulls/jellyfin/jellyfin.svg"/></a>
-<br/>
-<a href="https://opencollective.com/jellyfin"><img alt="Donate" src="https://img.shields.io/opencollective/all/jellyfin.svg?label=backers"/></a>
-<a href="https://features.jellyfin.org"><img alt="Submit Feature Requests" src="https://img.shields.io/badge/fider-vote%20on%20features-success.svg"/></a>
-<a href="https://matrix.to/#/#jellyfinorg:matrix.org"><img alt="Chat on Matrix" src="https://img.shields.io/matrix/jellyfinorg:matrix.org.svg?logo=matrix"/></a>
-<a href="https://github.com/jellyfin/jellyfin/releases.atom"><img alt="Release RSS Feed" src="https://img.shields.io/badge/rss-releases-ffa500?logo=rss" /></a>
-<a href="https://github.com/jellyfin/jellyfin/commits/master.atom"><img alt="Master Commits RSS Feed" src="https://img.shields.io/badge/rss-commits-ffa500?logo=rss" /></a>
-</p>
+## 一、功能改动（按模块）
+
+### 1. 视频工具 API — `Jellyfin.Api/Controllers/VideoToolsController.cs`
+
+新增一整套 `/VideoTools` 接口，全部需要**管理员**权限。前端菜单调用这些接口。
+
+**转码**
+
+- `POST /VideoTools/{itemId}/Transcode?codec=h265|av1&bitrateKbps=3000&resolution=1080p|4k`
+  单条入队。
+- `POST /VideoTools/Transcode` + body `["guid","guid"]`
+  批量入队，返回 `{ Added, Skipped, Jobs[], SkippedNames[] }`；没有本地文件 / 不是视频的条目按名字回报跳过。
+- 编码策略（自动挑选，失败逐级回退）：
+  - **H.265**：Intel QSV（`hevc_qsv`）→ NVIDIA NVENC（`hevc_nvenc`）→ 软件 `libx265`；
+  - **AV1**：Intel QSV（`av1_qsv`）→ NVIDIA NVENC（`av1_nvenc`）→ 软件 `libsvtav1`（preset 8）；
+  - 每个硬件编码器先试「硬解 + 硬编」，再试「软解 + 硬编」（显卡解不了这路视频时还能保住硬编），最后才是纯软件；
+  - 硬件编码器连续失败 2 次后，本进程内不再尝试（比如核显没有 AV1 硬编，就不会每个任务都白试一遍）；
+  - 实际用到的编码器会显示在「控制台 → 转码队列」的状态下方；回退到软件编码时文案是**「硬件编码不可用，已自动切换为软件编码」**；
+  - 想强制指定：环境变量 `VIDEOTOOLS_ENCODER` = `auto`（默认）/ `qsv` / `nvenc` / `software`。
+  - 音频统一 AAC 192k，文本字幕转 `mov_text`，位图字幕跳过，加 `+faststart`。
+- 分辨率默认 1080p、可选 4K，**只缩不放**（源比目标小就保持原尺寸）。
+
+**剪辑**
+
+- `POST /VideoTools/{itemId}/Cut?startSeconds=2&endSeconds=3&rotation=0|90|180|270`
+- `-ss` 输入端 + `-c copy` 流复制，秒完成、无损。
+- **旋转**：`rotation` 传 0 / 90 / 180 / 270（逆时针）。用 `-display_rotation`（放在 `-i` 之前）重写 display matrix，配合 `-c copy` 依然是流复制，**不重编码、秒完成**，画面无损。
+  注意它是绝对设置：源文件自带旋转元数据（手机竖拍）时会被覆盖成所选角度，而不是叠加。
+
+**剪辑预览（抽帧）**
+
+- `GET /VideoTools/{itemId}/Frame?timeSeconds=&maxWidth=480&rotation=0|90|180|270` → 单帧 JPEG。
+- 不进任务队列，单帧 0.1~0.3s；`SemaphoreSlim(2)` 限流，避免拖慢实时转码。
+- 按 `<itemId>_<源文件mtime>_<宽>_<旋转>_<时间>` 缓存到临时目录，命中约 2ms；超过 400 个自动清到 200 个。
+
+**图片旋转**
+
+- `POST /ImageTools/{itemId}/Rotate?degrees=90|180|270`：单张旋转。
+- `POST /ImageTools/Rotate?degrees=90` + body `["guid","guid"]`：批量旋转（多选菜单用这个），逐张串行处理并返回每张的结果。
+- 只接受 `Photo` 类型；用 ffmpeg `transpose` 滤镜**原地重写文件**（JPEG 质量 2、PNG 无损、WebP libwebp 95），旋转后重新排一次刷新任务，让数据库里的分辨率和缩略图跟上新像素。
+- 旋转和转码共用一把锁，避免同时改写同一个文件。
+
+**任务队列**
+
+- `GET /VideoTools/Jobs`、`GET /VideoTools/Jobs/{id}`
+- `DELETE /VideoTools/Jobs/Finished`：清掉已完成 / 失败 / 已取消，保留运行中和排队。
+- `POST /VideoTools/Jobs/{id}/Retry`：只允许失败任务，沿用原参数、输出名自动递增。
+- `POST /VideoTools/Jobs/{id}/Cancel`：排队中直接移除；运行中会终止 ffmpeg 并删掉半成品。
+- `GET /VideoTools/Jobs/{id}/Stream`：已完成任务的输出流地址，支持 Range，原生 `<video>` 用 `?ApiKey=<token>` 认证。
+- **文件任务串行执行**：同一时间只跑一个转码/剪辑，其余 `Queued` 并带队列位置；播放时的实时转码不经过这个队列，不受限制。
+- 队列清空后延迟 **2 秒**触发一次媒体库扫描（2 秒内又来新任务则取消本次扫描，等下一次清空）。
+
+### 2. 输出文件命名（自用规则，有点激进）
+
+- **转码**：新文件沿用源文件主名 `<源名>.mp4`；成功后源文件改名为 `<源名>.old.<原扩展名>` 保留（重名用 `名字 (1).old.mp4`）。
+- **剪辑**：新文件直接顶替源文件 `<源名>.<原扩展名>`，源文件同样改名成 `.old` 保留。
+- 两种操作都先写隐藏临时文件 `.<源名>.videotools.*`，成功后才做改名交换，**中途失败不会破坏源文件**；失败/取消会删临时文件。
+
+### 3. 转码稳定性补丁
+
+- **帧率修正**：探测 `avg_frame_rate` / `r_frame_rate`，转码时固定输出 `-r <真实帧率>`（吸附到 23.976 / 24 / 25 / 29.97 / 30 / 48 / 50 / 59.94 / 60 / 100 / 119.88 / 120）。
+  原因：很多手机/remux 文件的 `r_frame_rate` 是假的（30fps 报 `120/1`），编码器按假帧率分配码率预算，导致指定 3000k 实测只有 750k 且画面卡顿。
+- **编码器回退链**：见上面「编码策略」。规划器 `Jellyfin.Api/Helpers/TranscodePlanner.cs` 先用 `ffmpeg -encoders` 查本机 ffmpeg 支持哪些编码器，再按 QSV → NVENC → 软件 排序，逐个实际执行，第一个成功就停。
+  修的是两件事：一是核显没有 AV1 硬编、机器没有 N 卡时不再直接失败；二是 N 卡机器可以直接吃到 `hevc_nvenc` / `av1_nvenc`。
+- **解码回退**：`h264 / hevc / av1 / vp8 / vp9 / mpeg2video / vc1 / mjpeg` 以外的一律走软件解码（`scale=` 而不是 `scale_qsv` / `scale_cuda`）。
+  修的是 `.avi`(mpeg4/DivX) 直接失败的问题：QSV 解不了 mpeg4，会静默回退成 yuv420p，而 `scale_qsv` 只吃 QSV surface → 滤镜链整体失败。
+- 剪辑时长优先用 ffmpeg 探测的真实时长，探测不到才用数据库里的 `RunTimeTicks`（刚剪过的文件数据库时长是旧的）。
+
+### 4. 孤儿文件清理任务（控制台 → 计划任务）
+
+- `Emby.Server.Implementations/ScheduledTasks/Tasks/OrphanFileCleanupTask.cs`，默认 30 天跑一次。
+- 遍历所有媒体库目录，把「已经没有对应媒体文件」的附属文件（poster / fanart / 字幕 / nfo 等）**移动到数据目录下按日期命名的隔离文件夹**，不直接删除，随时可以捞回来。
+- 一天以内的新文件不动，目录级（文件夹本身）的图片永远不动。
+
+### 5. Emby 兼容层
+
+- Jellyfin 本身没有 `/emby` 路由前缀，而按 Emby 写的第三方工具（刮削器、统计脚本、Emby 客户端）所有请求都带这个前缀。`Jellyfin.Server/Startup.cs` 里加了一个中间件，路由前把 `/emby` 段剥掉（大小写不敏感），这类工具不用改配置就能直连。
+- **注意**：Jellyfin 13 的迁移 `DisableLegacyAuthorization` 默认关闭了旧式认证，`X-Emby-Token` / `X-MediaBrowser-Token` / `api_key=` 查询参数会全部返回 401。这类工具要用起来，需要把数据目录 `config/system.xml` 里的 `EnableLegacyAuthorization` 改成 `true`（冒烟测试用 `api_key=` 查 `/emby/Persons` 即可）。
+- 代价是 API key 允许通过 URL 查询参数传递，会出现在日志 / 代理日志里（Jellyfin 自己会把中间几位打码）。局域网自用够用，公网部署请自行权衡。
+
+### 6. 排序增强
+
+- `Jellyfin.Data/Enums/ItemSortBy.cs` 新增 `Size = 30`。
+- `OrderMapper.cs` 映射 `ItemSortBy.Size → e.Size`。
+- 新增 `SizeComparer`、`BitrateComparer` 内存排序比较器（自动注册）。
 
 ---
 
-Jellyfin is a Free Software Media System that puts you in control of managing and streaming your media. It is an alternative to the proprietary Emby and Plex, to provide media from a dedicated server to end-user devices via multiple apps. Jellyfin is descended from Emby's 3.5.2 release and ported to the .NET platform to enable full cross-platform support.
+## 二、构建与运行
 
-There are no strings attached, no premium licenses or features, and no hidden agendas: just a team that wants to build something better and work together to achieve it. We welcome anyone who is interested in joining us in our quest!
+环境要求：
 
-For further details, please see [our documentation page](https://jellyfin.org/docs/). To receive the latest updates, get help with Jellyfin, and join the community, please visit [one of our communication channels](https://jellyfin.org/docs/general/getting-help). For more information about the project, please see our [about page](https://jellyfin.org/docs/general/about).
-
-<strong>Want to get started?</strong><br/>
-Check out our <a href="https://jellyfin.org/downloads">downloads page</a> or our <a href="https://jellyfin.org/docs/general/installation/">installation guide</a>, then see our <a href="https://jellyfin.org/docs/general/quick-start">quick start guide</a>. You can also <a href="https://jellyfin.org/docs/general/installation/source">build from source</a>.<br/>
-
-<strong>Something not working right?</strong><br/>
-Open an <a href="https://jellyfin.org/docs/general/contributing/issues">Issue</a> on GitHub.<br/>
-
-<strong>Want to contribute?</strong><br/>
-Check out our <a href="https://jellyfin.org/contribute">contributing choose-your-own-adventure</a> to see where you can help, then see our <a href="https://jellyfin.org/docs/general/contributing/">contributing guide</a> and our <a href="https://jellyfin.org/docs/general/community-standards">community standards</a>.<br/>
-
-<strong>New idea or improvement?</strong><br/>
-Check out our <a href="https://features.jellyfin.org/?view=most-wanted">feature request hub</a>.<br/>
-
-<strong>Don't see Jellyfin in your language?</strong><br/>
-Check out our <a href="https://translate.jellyfin.org">Weblate instance</a> to help translate Jellyfin and its subprojects.<br/>
-
-<a href="https://translate.jellyfin.org/engage/jellyfin/?utm_source=widget">
-<img src="https://translate.jellyfin.org/widgets/jellyfin/-/jellyfin-web/multi-auto.svg" alt="Detailed Translation Status"/>
-</a>
-
----
-
-## Jellyfin Server
-
-This repository contains the code for Jellyfin's backend server. Note that this is only one of many projects under the Jellyfin GitHub [organization](https://github.com/jellyfin/) on GitHub. If you want to contribute, you can start by checking out our [documentation](https://jellyfin.org/docs/general/contributing/index.html) to see what to work on.
-
-## Server Development
-
-These instructions will help you get set up with a local development environment in order to contribute to this repository. Before you start, please be sure to completely read our [guidelines on development contributions](https://jellyfin.org/docs/general/contributing/development.html). Note that this project is supported on all major operating systems except FreeBSD, which is still incompatible.
-
-### Prerequisites
-
-Before the project can be built, you must first install the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet) on your system.
-
-Instructions to run this project from the command line are included here, but you will also need to install an IDE if you want to debug the server while it is running. Any IDE that supports .NET 6 development will work, but two options are recent versions of [Visual Studio](https://visualstudio.microsoft.com/downloads/) (at least 2022) and [Visual Studio Code](https://code.visualstudio.com/Download).
-
-[ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) will also need to be installed.
-
-### Cloning the Repository
-
-After dependencies have been installed you will need to clone a local copy of this repository. If you just want to run the server from source you can clone this repository directly, but if you are intending to contribute code changes to the project, you should [set up your own fork](https://jellyfin.org/docs/general/contributing/development.html#set-up-your-copy-of-the-repo) of the repository. The following example shows how you can clone the repository directly over HTTPS.
+- .NET SDK **10.0**（仓库 `global.json` 要求 10.0.0）
+- `ffmpeg`（转码/剪辑/抽帧全靠它），建议 6.0+；`ffmpeg -encoders` 用来看本机支持哪些编码器
+- **Node.js 20+ / npm**（只在需要自己构建前端时用）
+- 想用 QSV 硬编：Intel 核显 + `/dev/dri/renderD128` 权限（把运行用户加进 `render`、`video` 组，并用 `sg render -c ...` 启动）
+- 想用 NVENC 硬编：NVIDIA 显卡 + 能正常工作的驱动（`nvidia-smi` 有输出）。**不需要** CUDA Toolkit，ffmpeg 自带 NVENC 接口即可；容器里跑要挂 `--gpus all`
+- 两种显卡都没有也能跑：规划器会自动跳过硬件编码器，直接软件编码（H.265 用 `libx265`，AV1 用 `libsvtav1`）
 
 ```bash
-git clone https://github.com/jellyfin/jellyfin.git
+dotnet restore Jellyfin.Server/Jellyfin.Server.csproj
+dotnet build Jellyfin.Server/Jellyfin.Server.csproj -c Release --no-restore
+
+dotnet run --project Jellyfin.Server -c Release -- \
+  --datadir /path/to/data \
+  --webdir /path/to/jellyfin-web/dist
 ```
 
-### Installing the Web Client
+`--webdir` **必须**指向配套前端 [Dimerry/jellyfin-web](https://github.com/Dimerry/jellyfin-web) 的 `dist`（`npm run build:production` 产物）。
+不传、或者指向一个空目录 / 不存在的目录，服务端会**直接拒绝启动**并退出，日志里是：
 
-The server is configured to host the static files required for the [web client](https://github.com/jellyfin/jellyfin-web) in addition to serving the backend by default. Before you can run the server, you will need to get a copy of the web client since they are not included in this repository directly.
-
-Note that it is recommended for development to [host the web client separately](#hosting-the-web-client-separately) from the web server with some additional configuration, in which case you can skip this step.
-
-There are two options to get the files for the web client.
-
-1. Build them from source following the instructions on the [jellyfin-web repository](https://github.com/jellyfin/jellyfin-web)
-2. Get the pre-built files from an existing installation of the server. For example, with a Windows server installation the client files are located at `C:\Program Files\Jellyfin\Server\jellyfin-web`
-
-### Running The Server
-
-The following instructions will help you get the project up and running via the command line, or your preferred IDE.
-
-#### Running With Visual Studio
-
-To run the project with Visual Studio you can open the Solution (`.sln`) file and then press `F5` to run the server.
-
-#### Running With Visual Studio Code
-
-To run the project with Visual Studio Code you will first need to open the repository directory with Visual Studio Code using the `Open Folder...` option.
-
-Second, you need to [install the recommended extensions for the workspace](https://code.visualstudio.com/docs/editor/extension-gallery#_recommended-extensions). Note that extension recommendations are classified as either "Workspace Recommendations" or "Other Recommendations", but only the "Workspace Recommendations" are required.
-
-After the required extensions are installed, you can run the server by pressing `F5`.
-
-#### Running From the Command Line
-
-To run the server from the command line you can use the `dotnet run` command. The example below shows how to do this if you have cloned the repository into a directory named `jellyfin` (the default directory name) and should work on all operating systems.
-
-```bash
-cd jellyfin                          # Move into the repository directory
-dotnet run --project Jellyfin.Server --webdir /absolute/path/to/jellyfin-web/dist # Run the server startup project
+```
+The server is expected to host the web client, but the provided content directory is either invalid or empty
 ```
 
-A second option is to build the project and then run the resulting executable file directly. When running the executable directly you can easily add command line options. Add the `--help` flag to list details on all the supported command line options.
+（默认值是这个 DLL 旁边的 `jellyfin-web` 目录；官方发行包里自带，自己编译的没有。只想跑 API、不需要网页界面时，可以加 `--nowebclient` 跳过这项检查。）
 
-1. Build the project
+### 常见启动失败
 
-```bash
-dotnet build                       # Build the project
-cd Jellyfin.Server/bin/Debug/net10.0 # Change into the build output directory
-```
+- **`UnauthorizedAccessException: Access to the path '/home/<user>' is denied`（然后疯狂重启、日志暴涨）**
+  用 cron / systemd / 某些容器跑的时候，`HOME` 指向了不存在或不可写的目录，Jellyfin 建缓存目录时直接崩。
+  解决：显式指定 `HOME`、`XDG_DATA_HOME`、`XDG_CONFIG_HOME`、`XDG_CACHE_HOME` 到一个可写目录（本仓库根目录的 `run-jellyfin.sh` 就是这么干的，可以直接抄）。
+- **`The server is expected to host the web client...`**：见上面 `--webdir`。
+- **启动后转码立刻失败，日志里有 `Error while opening encoder`**：ffmpeg 这个编码器在编译时带了、但机器上没有对应硬件。这是正常的，规划器会自动跳到下一个编码器；如果连软件编码也失败，才需要看具体报错。
+- **端口不是 8096**：端口读的是数据目录里 `config/network.xml` 的 `InternalHttpPort`，不是默认值，别照抄别人的地址。
 
-2. Execute the build output. On Linux, Mac, etc. use `./jellyfin` and on Windows use `jellyfin.exe`.
-
-#### Accessing the Hosted Web Client
-
-If the Server is configured to host the Web Client, and the Server is running, the Web Client can be accessed at `http://localhost:8096` by default.
-
-API documentation can be viewed at `http://localhost:8096/api-docs/swagger/index.html`
-
-
-### Running from GitHub Codespaces
-
-As Jellyfin will run on a container on a GitHub hosted server, JF needs to handle some things differently.
-
-**NOTE:** Depending on the selected configuration (if you just click 'create codespace' it will create a default configuration one) it might take 20-30 seconds to load all extensions and prepare the environment while VS Code is already open. Just give it some time and wait until you see `Downloading .NET version(s) 7.0.15~x64 ...... Done!` in the output tab.
-
-**NOTE:** If you want to access the JF instance from outside, like with a WebClient on another PC, remember to set the "ports" in the lower VS Code window to public.
-
-**NOTE:** When first opening the server instance with any WebUI, you will be sent to the login instead of the setup page. Refresh the login page once and you should be redirected to the Setup.
-
-There are two configurations for you to choose from.
-#### Default - Development Jellyfin Server
-This creates a container that has everything to run and debug the Jellyfin Media server but does not setup anything else. Each time you create a new container you have to run through the whole setup again. There is also no ffmpeg, webclient or media preloaded. Use the `.NET Launch (nowebclient)` launch config to start the server.
-
-> Keep in mind that as this has no web client you have to connect to it via an external client. This can be just another codespace container running the WebUI. vuejs does not work from the get-go as it does not support the setup steps.
-
-#### Development Jellyfin Server ffmpeg
-this extends the default server with a default installation of ffmpeg6 though the means described here: https://jellyfin.org/docs/general/installation/linux#repository-manual
-If you want to install a specific ffmpeg version, follow the comments embedded in the `.devcontainer/Dev - Server Ffmpeg/install.ffmpeg.sh` file.
-
-Use the `ghcs .NET Launch (nowebclient, ffmpeg)` launch config to run with the jellyfin-ffmpeg enabled.
-
-
-### Running The Tests
-
-This repository also includes unit tests that are used to validate functionality as part of a CI pipeline on Azure. There are several ways to run these tests.
-
-1. Run tests from the command line using `dotnet test`
-2. Run tests in Visual Studio using the [Test Explorer](https://docs.microsoft.com/en-us/visualstudio/test/run-unit-tests-with-test-explorer)
-3. Run individual tests in Visual Studio Code using the associated [CodeLens annotation](https://github.com/OmniSharp/omnisharp-vscode/wiki/How-to-run-and-debug-unit-tests)
-
-### Advanced Configuration
-
-The following sections describe some more advanced scenarios for running the server from source that build upon the standard instructions above.
-
-#### Hosting The Web Client Separately
-
-It is not necessary to host the frontend web client as part of the backend server. Hosting these two components separately may be useful for frontend developers who would prefer to host the client in a separate webpack development server for a tighter development loop. See the [jellyfin-web](https://github.com/jellyfin/jellyfin-web#getting-started) repo for instructions on how to do this.
-
-To instruct the server not to host the web content, there is a `nowebclient` configuration flag that must be set. This can be specified using the command line
-switch `--nowebclient` or the environment variable `JELLYFIN_NOWEBCONTENT=true`.
-
-Since this is a common scenario, there is also a separate launch profile defined for Visual Studio called `Jellyfin.Server (nowebcontent)` that can be selected from the 'Start Debugging' dropdown in the main toolbar.
-
-**NOTE:** The setup wizard cannot be run if the web client is hosted separately.
+> 默认端口 8096；作者本机跑在 8196，纯属习惯。
 
 ---
-<p align="center">
-This project is supported by:
-<br/>
-<br/>
-<a href="https://www.jetbrains.com"><img src="https://gist.githubusercontent.com/anthonylavado/e8b2403deee9581e0b4cb8cd675af7db/raw/199ae22980ef5da64882ec2de3e8e5c03fe535b8/jetbrains.svg" height="50px" alt="JetBrains logo"></a>
-</p>
+
+## 三、免责声明
+
+- 个人自用 fork，代码质量按"能跑就行"标准，**没有测试覆盖**，不保证数据安全。
+- 转码/剪辑会**移动和改名你的媒体文件**（改成 `.old`），请先在小范围试。
+- 与 Jellyfin 官方无关，问题不要提到上游。
+
+## 四、许可
+
+沿用上游 [GPLv2](LICENSE)。

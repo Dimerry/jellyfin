@@ -73,6 +73,7 @@ public static class OrderMapper
             (ItemSortBy.ProductionYear, _) => e => e.ProductionYear,
             (ItemSortBy.CriticRating, _) => e => e.CriticRating,
             (ItemSortBy.VideoBitRate, _) => e => e.TotalBitrate,
+            (ItemSortBy.Size, _) => e => e.Size,
             (ItemSortBy.ParentIndexNumber, _) => e => e.ParentIndexNumber,
             (ItemSortBy.IndexNumber, _) => e => e.IndexNumber,
             // SeriesDatePlayed is normally handled via pre-aggregated join in ApplySeriesDatePlayedOrder.
